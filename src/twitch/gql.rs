@@ -3,7 +3,7 @@ use crate::error::{MinerError, Result};
 use regex::Regex;
 use reqwest::Client;
 use serde_json::{json, Value};
-use tracing::debug;
+use tracing::{debug, warn};
 
 #[derive(Debug, Clone)]
 pub struct GqlHeaders<'a> {
@@ -74,6 +74,25 @@ pub async fn gql_request_with_headers(
     operation: &gql::Op,
     variables: Value,
 ) -> Result<Value> {
+    gql_request_inner(client, headers, operation, variables, false).await
+}
+
+async fn gql_request_with_headers_allow_partial_data(
+    client: &Client,
+    headers: &GqlHeaders<'_>,
+    operation: &gql::Op,
+    variables: Value,
+) -> Result<Value> {
+    gql_request_inner(client, headers, operation, variables, true).await
+}
+
+async fn gql_request_inner(
+    client: &Client,
+    headers: &GqlHeaders<'_>,
+    operation: &gql::Op,
+    variables: Value,
+    allow_partial_data: bool,
+) -> Result<Value> {
     let resp = send_gql_single(client, headers, operation.name, operation.hash, &variables).await?;
 
     if let Some(errors) = resp.get("errors") {
@@ -88,15 +107,55 @@ pub async fn gql_request_with_headers(
                     send_gql_single(client, headers, operation.name, fallback_hash, &variables)
                         .await?;
                 if let Some(retry_errors) = retry_resp.get("errors") {
-                    return Err(MinerError::Gql(format!("{retry_errors:?}")));
+                    let retry_err_str = format!("{retry_errors:?}");
+                    if allow_partial_data && has_partial_follow_data(&retry_resp) {
+                        warn!(
+                            "GQL {} returned partial data with errors: {}",
+                            operation.name, retry_err_str
+                        );
+                        return Ok(retry_resp);
+                    }
+                    return Err(MinerError::Gql(retry_err_str));
                 }
                 return Ok(retry_resp);
             }
+        }
+        if allow_partial_data && has_partial_follow_data(&resp) {
+            warn!("GQL {} returned partial data with errors: {}", operation.name, err_str);
+            return Ok(resp);
         }
         return Err(MinerError::Gql(err_str));
     }
 
     Ok(resp)
+}
+
+fn has_partial_follow_data(resp: &Value) -> bool {
+    let Some(edges) = resp["data"]["user"]["follows"]["edges"].as_array() else {
+        return false;
+    };
+    let errors = match resp["errors"].as_array() {
+        Some(errors) if !errors.is_empty() => errors,
+        _ => return false,
+    };
+
+    !edges.is_empty()
+        && errors.iter().all(|error| {
+            let Some(path) = error["path"].as_array() else {
+                return false;
+            };
+            path.len() == 7
+                && path[0].as_str() == Some("user")
+                && path[1].as_str() == Some("follows")
+                && path[2].as_str() == Some("edges")
+                && path[3]
+                    .as_u64()
+                    .map(|index| index < edges.len() as u64)
+                    .unwrap_or(false)
+                && path[4].as_str() == Some("node")
+                && path[5].as_str() == Some("self")
+                && path[6].as_str() == Some("follower")
+        })
 }
 
 pub async fn gql_batch_request(
@@ -589,9 +648,18 @@ pub async fn get_followers_ext(
             variables["cursor"] = json!(c);
         }
 
-        let resp =
-            gql_request_with_headers(client, headers, &gql::CHANNEL_FOLLOWS, variables).await?;
+        // Twitch can return usable follow edges alongside resolver errors for the
+        // nested `self.follower` field. Keep those edges instead of discarding the
+        // entire page, while all other GQL operations remain strict about errors.
+        let resp = gql_request_with_headers_allow_partial_data(
+            client,
+            headers,
+            &gql::CHANNEL_FOLLOWS,
+            variables,
+        )
+        .await?;
 
+        let previous_cursor = cursor.clone();
         let follows = &resp["data"]["user"]["follows"];
         if let Some(edges) = follows["edges"].as_array() {
             for edge in edges {
@@ -608,6 +676,10 @@ pub async fn get_followers_ext(
             .as_bool()
             .unwrap_or(false);
         if !has_next || edges_empty(&resp) {
+            break;
+        }
+        if cursor == previous_cursor {
+            warn!("GQL ChannelFollows page had no advancing cursor; stopping pagination");
             break;
         }
     }
@@ -725,4 +797,34 @@ pub async fn contribute_community_goal(
 ) -> Result<Value> {
     let headers = GqlHeaders::basic(auth_token, device_id);
     contribute_community_goal_ext(client, &headers, goal_id, channel_id, points).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::has_partial_follow_data;
+    use serde_json::json;
+
+    #[test]
+    fn accepts_follow_edges_with_only_follower_resolver_errors() {
+        let response = json!({
+            "data": {"user": {"follows": {"edges": [{"node": {"login": "example"}}]}}},
+            "errors": [{
+                "message": "service error",
+                "path": ["user", "follows", "edges", 0, "node", "self", "follower"]
+            }]
+        });
+        assert!(has_partial_follow_data(&response));
+    }
+
+    #[test]
+    fn rejects_partial_follow_data_with_unrelated_errors() {
+        let response = json!({
+            "data": {"user": {"follows": {"edges": []}}},
+            "errors": [{
+                "message": "service error",
+                "path": ["user", "follows"]
+            }]
+        });
+        assert!(!has_partial_follow_data(&response));
+    }
 }
