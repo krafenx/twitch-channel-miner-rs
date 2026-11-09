@@ -185,11 +185,41 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    let app_config = match args.config {
+    let force_no_color = args.no_color || std::env::var_os("NO_COLOR").is_some();
+    let force_no_emoji = args.no_emoji;
+    let force_less = args.less;
+    let force_no_save = args.no_save_logs;
+
+    let mut app_config = match args.config.clone() {
         Some(path) => AppConfig::load(&path)
             .map_err(|e| MinerError::Auth(format!("Could not load config: {e}")))?,
         None => build_cli_config(args),
     };
+
+    if force_no_color {
+        app_config.logger.colored = false;
+        for acc in &mut app_config.accounts {
+            acc.logger.colored = false;
+        }
+    }
+    if force_no_emoji {
+        app_config.logger.emoji = false;
+        for acc in &mut app_config.accounts {
+            acc.logger.emoji = false;
+        }
+    }
+    if force_less {
+        app_config.logger.less = true;
+        for acc in &mut app_config.accounts {
+            acc.logger.less = true;
+        }
+    }
+    if force_no_save {
+        app_config.logger.save = false;
+        for acc in &mut app_config.accounts {
+            acc.logger.save = false;
+        }
+    }
 
     run_miner_app(app_config).await
 }
@@ -421,8 +451,14 @@ async fn run_account(
     )?;
     auth.login().await?;
 
-    let token = auth.access_token.clone().unwrap();
-    let user_id = auth.user_id.clone().unwrap();
+    let token = auth
+        .access_token
+        .clone()
+        .ok_or_else(|| MinerError::Auth("Missing access_token after login".into()))?;
+    let user_id = auth
+        .user_id
+        .clone()
+        .ok_or_else(|| MinerError::Auth("Missing user_id after login".into()))?;
     if user_id.is_empty() {
         return Err(MinerError::Auth("Empty user_id returned by Twitch".into()));
     }
@@ -444,8 +480,24 @@ async fn run_account(
         }
     }
 
-    // Build streamer list (manual list + optional followed channels - blacklist)
-    let mut names = account.streamers.clone();
+    // Build streamer list (manual list + optional followed channels - blacklist), normalized & deduplicated
+    let blacklist: Vec<String> = account
+        .blacklist
+        .iter()
+        .map(|s| normalize_channel_name(s))
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let mut names: Vec<String> = Vec::new();
+    for raw in &account.streamers {
+        let clean = normalize_channel_name(raw);
+        if !clean.is_empty()
+            && !is_blacklisted(&clean, &blacklist)
+            && !names.iter().any(|item| item == &clean)
+        {
+            names.push(clean);
+        }
+    }
     if account.followers {
         logger.info("📋", "Loading followed channels...");
         let ver = client.current_client_version();
@@ -468,9 +520,11 @@ async fn run_account(
         {
             Ok(follows) => {
                 logger.info("📋", &format!("Loaded {} followed channels", follows.len()));
-                for name in follows {
-                    if !is_blacklisted(&name, &account.blacklist)
-                        && !names.iter().any(|item| item.eq_ignore_ascii_case(&name))
+                for raw in follows {
+                    let name = normalize_channel_name(&raw);
+                    if !name.is_empty()
+                        && !is_blacklisted(&name, &blacklist)
+                        && !names.iter().any(|item| item == &name)
                     {
                         names.push(name);
                     }
@@ -479,7 +533,6 @@ async fn run_account(
             Err(error) => logger.warn(&format!("Loading follows failed: {error}")),
         }
     }
-    names.retain(|name| !is_blacklisted(name, &account.blacklist));
 
     logger.info(
         "🤓",
@@ -496,8 +549,17 @@ async fn run_account(
 
         let profile = account
             .streamer_settings
-            .get(&name.to_lowercase())
+            .get(name)
             .cloned()
+            .or_else(|| {
+                account.streamer_settings.iter().find_map(|(k, v)| {
+                    if normalize_channel_name(k) == *name {
+                        Some(v.clone())
+                    } else {
+                        None
+                    }
+                })
+            })
             .unwrap_or_else(|| account.default_streamer_settings.clone());
 
         let mut streamer = Streamer::new(name).with_settings(profile);
@@ -548,15 +610,22 @@ async fn run_account(
     // Background Drop campaigns & inventory sync (ported from `sync_campaigns_thread`)
     let any_drops = streamers.iter().any(|s| s.settings.claim_drops);
     let campaigns_handle = if any_drops {
+        let mut initial_campaigns: Vec<Campaign> = Vec::new();
+        if let Err(e) = client
+            .sync_campaigns_once(&streamers, true, &mut initial_campaigns)
+            .await
+        {
+            client.log_warn(&format!("Initial campaign sync failed: {e}"));
+        }
         let camp_client = Arc::clone(&client);
         let camp_streamers = streamers.clone();
         let dash_interval = settings.drops_claim_interval_secs.max(300);
         Some(tokio::spawn(async move {
-            let mut cached_campaigns: Vec<Campaign> = Vec::new();
-            let mut last_dash = std::time::Instant::now()
-                .checked_sub(Duration::from_secs(dash_interval + 1))
-                .unwrap_or_else(std::time::Instant::now);
+            let mut cached_campaigns: Vec<Campaign> = initial_campaigns;
+            let mut last_dash = std::time::Instant::now();
             let mut ticker = tokio::time::interval(Duration::from_secs(60));
+            // Skip immediate first tick since we just ran initial sync above
+            ticker.tick().await;
             loop {
                 ticker.tick().await;
                 let refresh_dash = last_dash.elapsed() >= Duration::from_secs(dash_interval);
@@ -574,6 +643,55 @@ async fn run_account(
         }))
     } else {
         None
+    };
+
+    // Background stream online/offline status & IRC chat sync (never blocks minute-watched loop)
+    let status_handle = {
+        let status_client = Arc::clone(&client);
+        let status_streamers = streamers.clone();
+        let status_chat = Arc::clone(&chat_pool);
+        let status_interval = Duration::from_secs(settings.status_refresh_secs.max(30));
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(status_interval);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                for streamer in &status_streamers {
+                    let _ = status_client.update_stream_status(streamer).await;
+                    let online = streamer.is_online();
+                    match streamer.settings.chat.unwrap_or(chat_presence) {
+                        ChatPresence::Always => status_chat.ensure_joined(&streamer.username),
+                        ChatPresence::Online if online => {
+                            status_chat.ensure_joined(&streamer.username)
+                        }
+                        ChatPresence::Offline if !online => {
+                            status_chat.ensure_joined(&streamer.username)
+                        }
+                        _ => status_chat.leave(&streamer.username),
+                    }
+                }
+            }
+        })
+    };
+
+    // Background periodic ChannelPointsContext refresh on online channels (every 30m by default)
+    let context_handle = {
+        let ctx_client = Arc::clone(&client);
+        let ctx_streamers = streamers.clone();
+        let ctx_interval = Duration::from_secs(settings.context_refresh_secs.max(300));
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(ctx_interval);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                ctx_client.refresh_client_version().await;
+                for streamer in &ctx_streamers {
+                    if streamer.is_online() {
+                        ctx_client.load_channel_points_context(streamer).await;
+                    }
+                }
+            }
+        })
     };
 
     // Multi-socket PubSub WebSocket pool (<=50 topics per socket)
@@ -625,8 +743,6 @@ async fn run_account(
         .await;
 
     let watch_base_secs = settings.watch_interval_secs.max(10);
-    let mut last_status_refresh = std::time::Instant::now();
-    let mut last_context_refresh = std::time::Instant::now();
     let mut idle_ticks = 0u64;
 
     loop {
@@ -637,33 +753,7 @@ async fn run_account(
                 }
             }
             _ = tokio::time::sleep(Duration::from_secs(1)) => {
-                // 1. Periodic stream online/offline check + IRC chat sync
-                if last_status_refresh.elapsed() >= Duration::from_secs(settings.status_refresh_secs.max(30)) {
-                    last_status_refresh = std::time::Instant::now();
-                    for streamer in &streamers {
-                        let _ = client.update_stream_status(streamer).await;
-                        let online = streamer.is_online();
-                        match streamer.settings.chat.unwrap_or(chat_presence) {
-                            ChatPresence::Always => chat_pool.ensure_joined(&streamer.username),
-                            ChatPresence::Online if online => chat_pool.ensure_joined(&streamer.username),
-                            ChatPresence::Offline if !online => chat_pool.ensure_joined(&streamer.username),
-                            _ => chat_pool.leave(&streamer.username),
-                        }
-                    }
-                }
-
-                // 2. Periodic ChannelPointsContext refresh every 30m on online channels (matches upstream)
-                if last_context_refresh.elapsed() >= Duration::from_secs(settings.context_refresh_secs.max(300)) {
-                    last_context_refresh = std::time::Instant::now();
-                    client.refresh_client_version().await;
-                    for streamer in &streamers {
-                        if streamer.is_online() {
-                            client.load_channel_points_context(streamer).await;
-                        }
-                    }
-                }
-
-                // 3. Select channels by priority and send minute-watched
+                // Select channels by priority and send minute-watched
                 let selected: Vec<SharedStreamer> = select_streamers_to_watch(&streamers, &settings)
                     .into_iter()
                     .cloned()
@@ -686,23 +776,11 @@ async fn run_account(
 
                 for streamer in &selected {
                     let iter_start = std::time::Instant::now();
-                    match client.send_minute_watched(streamer).await {
-                        Ok(()) => {
-                            if let Some(a) = &analytics {
-                                a.record(
-                                    &username,
-                                    &streamer.username,
-                                    streamer.channel_points() as i64,
-                                    "Watch",
-                                );
-                            }
-                        }
-                        Err(error) => {
-                            logger.debug(&format!(
-                                "minute-watched failed for {}: {}",
-                                streamer.username, error
-                            ));
-                        }
+                    if let Err(error) = client.send_minute_watched(streamer).await {
+                        logger.debug(&format!(
+                            "minute-watched failed for {}: {}",
+                            streamer.username, error
+                        ));
                     }
                     let remaining = Duration::from_secs_f64(per_streamer_pause)
                         .saturating_sub(iter_start.elapsed());
@@ -723,6 +801,8 @@ async fn run_account(
     // Graceful shutdown & Final Session Report
     chat_pool.leave_all();
     ws_handle.abort();
+    status_handle.abort();
+    context_handle.abort();
     if let Some(ch) = campaigns_handle {
         ch.abort();
     }
@@ -802,6 +882,10 @@ fn print_session_report(
             logger.info("💰", &format!("{header}\n{hist_lines}"));
         }
     }
+}
+
+fn normalize_channel_name(raw: &str) -> String {
+    raw.trim().trim_start_matches('@').to_lowercase()
 }
 
 fn is_blacklisted(name: &str, blacklist: &[String]) -> bool {

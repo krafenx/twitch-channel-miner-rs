@@ -117,19 +117,55 @@ impl TwitchAuth {
     fn session_path(username: &str) -> PathBuf {
         let mut path = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
         path.push("twitch-points-miner");
+        path.push("sessions");
         std::fs::create_dir_all(&path).ok();
-        path.push(format!("{}.json", username.to_lowercase()));
+        let safe = crate::logger::sanitize_filename(username);
+        path.push(format!("{safe}.json"));
         path
     }
 
-    pub fn load_session(&mut self) -> Result<bool> {
-        let path = Self::session_path(&self.username);
-        if !path.exists() {
-            return Ok(false);
+    fn legacy_session_path(username: &str) -> Option<PathBuf> {
+        let lower = username.trim().to_lowercase();
+        if lower.is_empty() || lower == "config" {
+            return None;
         }
+        let mut path = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
+        path.push("twitch-points-miner");
+        path.push(format!("{lower}.json"));
+        Some(path)
+    }
 
-        let data = std::fs::read_to_string(&path)?;
-        let session: SavedSession = serde_json::from_str(&data)?;
+    pub fn load_session(&mut self) -> Result<bool> {
+        let primary = Self::session_path(&self.username);
+        let path = if primary.exists() {
+            primary
+        } else if let Some(legacy) = Self::legacy_session_path(&self.username).filter(|p| p.exists())
+        {
+            legacy
+        } else {
+            return Ok(false);
+        };
+
+        let data = match std::fs::read_to_string(&path) {
+            Ok(d) => d,
+            Err(e) => {
+                self.log_warn(&format!(
+                    "Could not read saved session {}: {e}; will re-login",
+                    path.display()
+                ));
+                return Ok(false);
+            }
+        };
+        let session: SavedSession = match serde_json::from_str(&data) {
+            Ok(s) => s,
+            Err(e) => {
+                self.log_warn(&format!(
+                    "Saved session {} is corrupted ({e}); starting fresh login",
+                    path.display()
+                ));
+                return Ok(false);
+            }
+        };
 
         if Utc::now() - session.saved_at > Duration::days(60) {
             self.log_warn("Saved session is older than 60 days, will re-validate / re-login");
@@ -263,7 +299,7 @@ impl TwitchAuth {
         Ok(())
     }
 
-    async fn validate_token(&self) -> Result<()> {
+    async fn validate_token(&mut self) -> Result<()> {
         let token = self
             .access_token
             .as_ref()
@@ -276,11 +312,29 @@ impl TwitchAuth {
             .send()
             .await?;
 
-        if resp.status().is_success() {
-            Ok(())
-        } else {
-            Err(MinerError::Auth("Token validation failed".into()))
+        if !resp.status().is_success() {
+            return Err(MinerError::Auth("Token validation failed".into()));
         }
+
+        if let Ok(json) = resp.json::<serde_json::Value>().await {
+            if let Some(login) = json.get("login").and_then(|v| v.as_str()) {
+                if !self.username.trim().is_empty()
+                    && !login.eq_ignore_ascii_case(self.username.trim())
+                {
+                    self.log_warn(&format!(
+                        "Validated token belongs to '{}' rather than '{}'; re-authenticating",
+                        login, self.username
+                    ));
+                    return Err(MinerError::Auth("Token username mismatch".into()));
+                }
+            }
+            if let Some(uid) = json.get("user_id").and_then(|v| v.as_str()) {
+                if !uid.is_empty() {
+                    self.user_id = Some(uid.to_string());
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn fetch_user_id(&mut self) -> Result<()> {

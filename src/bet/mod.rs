@@ -496,7 +496,8 @@ impl PredictionEvent {
 
         // Upstream stealth_mode: if our calculated wager >= top bettor's wager on that outcome,
         // place `top_points - (1..=4)` so we never appear as the #1 top predictor in chat.
-        if settings.stealth_mode && outcome.top_points > 0 && amount >= outcome.top_points {
+        // When `top_points == 0` (nobody bet yet), `saturating_sub` yields `0` (< 10 -> skipped).
+        if settings.stealth_mode && amount >= outcome.top_points {
             let reduce = rand_stealth_offset();
             amount = outcome.top_points.saturating_sub(reduce).min(balance);
         }
@@ -553,6 +554,7 @@ pub struct EventPredictionRecord {
 #[derive(Debug, Clone)]
 pub struct ParsedPredictionResult {
     pub result_type: String,
+    pub decision_amount: i64,
     pub placed: i64,
     pub won: i64,
     pub gained: i64,
@@ -661,6 +663,7 @@ impl EventPredictionRecord {
 
         ParsedPredictionResult {
             result_type,
+            decision_amount: placed_amt,
             placed,
             won,
             gained,

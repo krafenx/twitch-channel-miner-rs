@@ -123,7 +123,12 @@ impl TwitchClient {
     }
 
     pub async fn resolve_streamer(&self, streamer: &mut Streamer) -> Result<()> {
-        let token = self.auth.access_token.as_ref().unwrap().clone();
+        let token = self
+            .auth
+            .access_token
+            .as_ref()
+            .ok_or_else(|| MinerError::Auth("Not authenticated".into()))?
+            .clone();
         let ver = self.current_client_version();
         let headers = GqlHeaders {
             auth_token: &token,
@@ -290,7 +295,12 @@ impl TwitchClient {
             return Ok(());
         }
 
-        let token = self.auth.access_token.as_ref().unwrap().clone();
+        let token = self
+            .auth
+            .access_token
+            .as_ref()
+            .ok_or_else(|| MinerError::Auth("Not authenticated".into()))?
+            .clone();
         let channel_id = streamer
             .channel_id
             .as_ref()
@@ -308,6 +318,9 @@ impl TwitchClient {
             .await
             .unwrap_or(false);
 
+        if !live {
+            streamer.mark_offline_checked();
+        }
         let transitioned = streamer.set_online_with_transition(live, initial_resolve);
 
         if live {
@@ -339,7 +352,12 @@ impl TwitchClient {
             return Ok(());
         }
 
-        let token = self.auth.access_token.as_ref().unwrap().clone();
+        let token = self
+            .auth
+            .access_token
+            .as_ref()
+            .ok_or_else(|| MinerError::Auth("Not authenticated".into()))?
+            .clone();
         let ver = self.current_client_version();
         let headers = GqlHeaders {
             auth_token: &token,
@@ -508,8 +526,18 @@ impl TwitchClient {
             }
         }
 
-        let token = self.auth.access_token.as_ref().unwrap().clone();
-        let user_id = self.auth.user_id.as_ref().unwrap().clone();
+        let token = self
+            .auth
+            .access_token
+            .as_ref()
+            .ok_or_else(|| MinerError::Auth("Not authenticated".into()))?
+            .clone();
+        let user_id = self
+            .auth
+            .user_id
+            .as_ref()
+            .ok_or_else(|| MinerError::Auth("Not authenticated".into()))?
+            .clone();
         let ver = self.current_client_version();
         let headers = GqlHeaders {
             auth_token: &token,
@@ -682,7 +710,12 @@ impl TwitchClient {
 
     /// Claim all claimable drops from inventory
     pub async fn claim_all_drops(&self) -> Result<u32> {
-        let token = self.auth.access_token.as_ref().unwrap().clone();
+        let token = self
+            .auth
+            .access_token
+            .as_ref()
+            .ok_or_else(|| MinerError::Auth("Not authenticated".into()))?
+            .clone();
         let ver = self.current_client_version();
         let headers = GqlHeaders {
             auth_token: &token,
@@ -756,8 +789,18 @@ impl TwitchClient {
         refresh_dashboard: bool,
         campaigns: &mut Vec<Campaign>,
     ) -> Result<()> {
-        let token = self.auth.access_token.as_ref().unwrap().clone();
-        let user_id = self.auth.user_id.as_ref().unwrap().clone();
+        let token = self
+            .auth
+            .access_token
+            .as_ref()
+            .ok_or_else(|| MinerError::Auth("Not authenticated".into()))?
+            .clone();
+        let user_id = self
+            .auth
+            .user_id
+            .as_ref()
+            .ok_or_else(|| MinerError::Auth("Not authenticated".into()))?
+            .clone();
         let ver = self.current_client_version();
         let headers = GqlHeaders {
             auth_token: &token,
@@ -767,6 +810,16 @@ impl TwitchClient {
         };
 
         if refresh_dashboard || campaigns.is_empty() {
+            let mut prev_progress: HashMap<String, (u64, u64)> = HashMap::new();
+            for camp in campaigns.iter() {
+                for d in &camp.drops {
+                    prev_progress.insert(
+                        d.id.clone(),
+                        (d.current_minutes_watched, d.percentage_progress),
+                    );
+                }
+            }
+
             let _ = self.claim_all_drops().await;
             if let Ok(dash) = gql::get_drops_dashboard_ext(&self.auth.client, &headers).await {
                 let active_ids: Vec<String> = dash["data"]["currentUser"]["dropCampaigns"]
@@ -784,28 +837,36 @@ impl TwitchClient {
                     })
                     .unwrap_or_default();
 
-                if !active_ids.is_empty() {
-                    if let Ok(details) = gql::get_campaign_details_batch(
-                        &self.auth.client,
-                        &headers,
-                        &active_ids,
-                        &user_id,
-                    )
-                    .await
-                    {
-                        let mut fresh = Vec::new();
-                        for d in &details {
-                            if let Some(mut c) = Campaign::from_gql(d) {
-                                if c.dt_match {
-                                    c.clear_drops();
-                                    if !c.drops.is_empty() {
-                                        fresh.push(c);
+                if active_ids.is_empty() {
+                    campaigns.clear();
+                } else if let Ok(details) = gql::get_campaign_details_batch(
+                    &self.auth.client,
+                    &headers,
+                    &active_ids,
+                    &user_id,
+                )
+                .await
+                {
+                    let mut fresh = Vec::new();
+                    for d in &details {
+                        if let Some(mut c) = Campaign::from_gql(d) {
+                            if c.dt_match {
+                                for drop in &mut c.drops {
+                                    if let Some(&(mins, pct)) = prev_progress.get(&drop.id) {
+                                        if drop.current_minutes_watched == 0 {
+                                            drop.current_minutes_watched = mins;
+                                            drop.percentage_progress = pct;
+                                        }
                                     }
+                                }
+                                c.clear_drops();
+                                if !c.drops.is_empty() {
+                                    fresh.push(c);
                                 }
                             }
                         }
-                        *campaigns = fresh;
                     }
+                    *campaigns = fresh;
                 }
             }
         }
@@ -867,9 +928,11 @@ impl TwitchClient {
             }
         }
 
-        // Bind matching campaigns to each online streamer
+        // Bind matching campaigns to each streamer (delivering each printable milestone at most once)
+        let mut printable_delivered = std::collections::HashSet::new();
         for streamer in streamers {
             if !streamer.settings.claim_drops || !streamer.is_online() {
+                streamer.stream.lock().unwrap().campaigns.clear();
                 continue;
             }
             let cid_opt = streamer.channel_id.clone();
@@ -879,12 +942,14 @@ impl TwitchClient {
                 continue;
             };
             let allowed_cids = st.campaigns_ids.clone();
-            st.campaigns = campaigns
+            let has_drops_tag = st.drops_tags;
+            let mut matched: Vec<Campaign> = campaigns
                 .iter()
                 .filter(|c| {
                     !c.drops.is_empty()
                         && c.game_id.as_deref() == Some(stream_game_id.as_str())
                         && (allowed_cids.contains(&c.id)
+                            || (c.channels.is_empty() && has_drops_tag)
                             || (!c.channels.is_empty()
                                 && cid_opt
                                     .as_ref()
@@ -893,6 +958,21 @@ impl TwitchClient {
                 })
                 .cloned()
                 .collect();
+
+            for camp in &mut matched {
+                for d in &mut camp.drops {
+                    if d.is_printable && !printable_delivered.insert(d.id.clone()) {
+                        d.is_printable = false;
+                    }
+                }
+            }
+            st.campaigns = matched;
+        }
+        // Consume `is_printable` on master cache so next 60s sync doesn't re-emit the same milestone
+        for camp in campaigns.iter_mut() {
+            for d in &mut camp.drops {
+                d.is_printable = false;
+            }
         }
 
         Ok(())
@@ -918,7 +998,12 @@ impl TwitchClient {
             return Ok(());
         }
 
-        let token = self.auth.access_token.as_ref().unwrap().clone();
+        let token = self
+            .auth
+            .access_token
+            .as_ref()
+            .ok_or_else(|| MinerError::Auth("Not authenticated".into()))?
+            .clone();
         let ver = self.current_client_version();
         let headers = GqlHeaders {
             auth_token: &token,

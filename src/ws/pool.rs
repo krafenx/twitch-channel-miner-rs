@@ -11,7 +11,7 @@ use crate::twitch::TwitchClient;
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -299,7 +299,7 @@ impl WebSocketPool {
             }
         });
 
-        let mut last_dedup_key: Option<(String, String)> = None;
+        let mut recent_dedup: VecDeque<(String, String)> = VecDeque::with_capacity(32);
 
         loop {
             tokio::select! {
@@ -314,7 +314,7 @@ impl WebSocketPool {
                         Ok(Message::Text(text)) => {
                             if let Ok(data) = serde_json::from_str::<Value>(&text) {
                                 let should_reconnect = self
-                                    .handle_message(ws_index, &data, &last_pong, &mut last_dedup_key)
+                                    .handle_message(ws_index, &data, &last_pong, &mut recent_dedup)
                                     .await;
                                 if should_reconnect {
                                     break;
@@ -345,7 +345,7 @@ impl WebSocketPool {
         ws_index: usize,
         data: &Value,
         last_pong: &Arc<StdMutex<Instant>>,
-        last_dedup_key: &mut Option<(String, String)>,
+        recent_dedup: &mut VecDeque<(String, String)>,
     ) -> bool {
         let msg_type = data.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
@@ -400,15 +400,25 @@ impl WebSocketPool {
                             .unwrap_or("")
                             .to_string();
                         if !ts.is_empty() {
-                            let ident = format!("{inner_type}.{topic}");
-                            if last_dedup_key
-                                .as_ref()
-                                .map(|(prev_ts, prev_id)| prev_ts == &ts && prev_id == &ident)
-                                .unwrap_or(false)
+                            let sub_id = inner["data"]["claim"]["id"]
+                                .as_str()
+                                .or_else(|| inner["data"]["point_gain"]["channel_id"].as_str())
+                                .or_else(|| inner["data"]["balance"]["channel_id"].as_str())
+                                .or_else(|| inner["data"]["channel_id"].as_str())
+                                .or_else(|| inner["data"]["event"]["id"].as_str())
+                                .or_else(|| inner["data"]["prediction"]["id"].as_str())
+                                .unwrap_or("");
+                            let ident = format!("{inner_type}.{topic}.{sub_id}");
+                            if recent_dedup
+                                .iter()
+                                .any(|(prev_ts, prev_id)| prev_ts == &ts && prev_id == &ident)
                             {
                                 return false;
                             }
-                            *last_dedup_key = Some((ts, ident));
+                            if recent_dedup.len() >= 32 {
+                                recent_dedup.pop_front();
+                            }
+                            recent_dedup.push_back((ts, ident));
                         }
                         self.handle_pubsub_topic(topic, &inner).await;
                     }
@@ -506,8 +516,12 @@ impl WebSocketPool {
                     }
                 }
                 "claim-available" => {
-                    if let Some(claim_id) = data["data"]["claim"]["id"].as_str() {
-                        self.twitch.claim_bonus(&streamer, claim_id).await;
+                    if let Some(claim_id) = data["data"]["claim"]["id"].as_str().map(String::from) {
+                        let twitch = Arc::clone(&self.twitch);
+                        let streamer = Arc::clone(&streamer);
+                        tokio::spawn(async move {
+                            twitch.claim_bonus(&streamer, &claim_id).await;
+                        });
                     }
                 }
                 _ => debug!("community-points-user-v1 event: {}", msg_type),
@@ -532,9 +546,30 @@ impl WebSocketPool {
                     }
                 }
                 "viewcount" => {
-                    if !streamer.is_online() && streamer.stream_up_elapsed() {
-                        let _ = self.twitch.update_stream_status(&streamer).await;
-                        self.sync_streamer_chat(&streamer);
+                    if !streamer.is_online()
+                        && streamer.stream_up_elapsed()
+                        && !streamer.is_in_offline_cooldown()
+                    {
+                        let twitch = Arc::clone(&self.twitch);
+                        let streamer = Arc::clone(&streamer);
+                        let chat_pool = self.chat_pool.clone();
+                        let default_chat = self.default_chat_presence;
+                        tokio::spawn(async move {
+                            let _ = twitch.update_stream_status(&streamer).await;
+                            if let Some(cp) = chat_pool {
+                                let online = streamer.is_online();
+                                match streamer.settings.chat.unwrap_or(default_chat) {
+                                    ChatPresence::Always => cp.ensure_joined(&streamer.username),
+                                    ChatPresence::Online if online => {
+                                        cp.ensure_joined(&streamer.username)
+                                    }
+                                    ChatPresence::Offline if !online => {
+                                        cp.ensure_joined(&streamer.username)
+                                    }
+                                    _ => cp.leave(&streamer.username),
+                                }
+                            }
+                        });
                     }
                 }
                 _ => {}
@@ -550,7 +585,8 @@ impl WebSocketPool {
             let msg_type = data.get("type").and_then(|v| v.as_str()).unwrap_or("");
             if msg_type == "raid_update_v2" || data.get("raid").is_some() {
                 let raid_obj = data.get("raid").unwrap_or(data);
-                let Some(raid_id) = raid_obj.get("id").and_then(|v| v.as_str()) else {
+                let Some(raid_id) = raid_obj.get("id").and_then(|v| v.as_str()).map(String::from)
+                else {
                     return;
                 };
                 let target_login = raid_obj
@@ -560,7 +596,7 @@ impl WebSocketPool {
                     .to_string();
 
                 let new_raid = RaidInfo {
-                    raid_id: raid_id.to_string(),
+                    raid_id: raid_id.clone(),
                     target_login: target_login.clone(),
                 };
                 let is_new = {
@@ -573,31 +609,34 @@ impl WebSocketPool {
                     }
                 };
                 if is_new {
-                    let Some(token) = self.twitch.auth.access_token.as_ref().cloned() else {
-                        return;
-                    };
-                    let ver = self.twitch.current_client_version();
-                    let headers = GqlHeaders {
-                        auth_token: &token,
-                        device_id: &self.twitch.auth.device_id,
-                        client_version: &ver,
-                        client_session_id: Some(&self.twitch.client_session_id),
-                    };
-                    match gql::join_raid_ext(&self.twitch.auth.client, &headers, raid_id).await {
-                        Ok(_) => {
-                            let msg = format!(
-                                "Joining raid from {} to {}!",
-                                streamer.display_str(less),
-                                target_login
-                            );
-                            self.twitch
-                                .log_event(LogLevel::Info, "🎭", Some(MinerEvent::JoinRaid), &msg)
-                                .await;
+                    let twitch = Arc::clone(&self.twitch);
+                    let streamer = Arc::clone(&streamer);
+                    tokio::spawn(async move {
+                        let Some(token) = twitch.auth.access_token.as_ref().cloned() else {
+                            return;
+                        };
+                        let ver = twitch.current_client_version();
+                        let headers = GqlHeaders {
+                            auth_token: &token,
+                            device_id: &twitch.auth.device_id,
+                            client_version: &ver,
+                            client_session_id: Some(&twitch.client_session_id),
+                        };
+                        match gql::join_raid_ext(&twitch.auth.client, &headers, &raid_id).await {
+                            Ok(_) => {
+                                let msg = format!(
+                                    "Joining raid from {} to {}!",
+                                    streamer.display_str(less),
+                                    target_login
+                                );
+                                twitch
+                                    .log_event(LogLevel::Info, "🎭", Some(MinerEvent::JoinRaid), &msg)
+                                    .await;
+                            }
+                            Err(e) => twitch
+                                .log_warn(&format!("Failed to join raid {}: {}", raid_id, e)),
                         }
-                        Err(e) => self
-                            .twitch
-                            .log_warn(&format!("Failed to join raid {}: {}", raid_id, e)),
-                    }
+                    });
                 }
             }
         } else if topic.starts_with("community-moments-channel-v1.") {
@@ -614,8 +653,13 @@ impl WebSocketPool {
                     .and_then(|d| d.get("moment_id"))
                     .and_then(|v| v.as_str())
                     .or_else(|| data.get("moment_id").and_then(|v| v.as_str()))
+                    .map(String::from)
                 {
-                    self.twitch.claim_moment(&streamer, moment_id).await;
+                    let twitch = Arc::clone(&self.twitch);
+                    let streamer = Arc::clone(&streamer);
+                    tokio::spawn(async move {
+                        twitch.claim_moment(&streamer, &moment_id).await;
+                    });
                 }
             }
         } else if topic.starts_with("predictions-channel-v1.") {
@@ -638,7 +682,11 @@ impl WebSocketPool {
                 "community-goal-created" | "community-goal-updated" => {
                     if let Some(goal) = CommunityGoal::from_pubsub(goal_val) {
                         streamer.update_community_goal(goal);
-                        let _ = self.twitch.contribute_community_goals(&streamer).await;
+                        let twitch = Arc::clone(&self.twitch);
+                        let streamer = Arc::clone(&streamer);
+                        tokio::spawn(async move {
+                            let _ = twitch.contribute_community_goals(&streamer).await;
+                        });
                     }
                 }
                 "community-goal-deleted" => {
@@ -906,6 +954,11 @@ impl WebSocketPool {
                             .as_str()
                             .filter(|s| !s.is_empty())
                         {
+                            {
+                                let mut guard = shared_record.lock().unwrap();
+                                guard.bet_placed = false;
+                                guard.decision = None;
+                            }
                             twitch
                                 .log_event(
                                     LogLevel::Error,
@@ -917,6 +970,11 @@ impl WebSocketPool {
                         }
                     }
                     Err(e) => {
+                        {
+                            let mut guard = shared_record.lock().unwrap();
+                            guard.bet_placed = false;
+                            guard.decision = None;
+                        }
                         twitch
                             .log_event(
                                 LogLevel::Error,
@@ -1013,7 +1071,7 @@ impl WebSocketPool {
                         streamer.update_history("PREDICTION", parsed.gained, 1);
                         // Deduplicate prior community-points-user-v1 history entries, matching WebSocketsPool.py
                         if parsed.result_type == "REFUND" {
-                            streamer.update_history("REFUND", -parsed.placed, -1);
+                            streamer.update_history("REFUND", -parsed.decision_amount, -1);
                         } else if parsed.result_type == "WIN" {
                             streamer.update_history("PREDICTION", -parsed.won, -1);
                         }

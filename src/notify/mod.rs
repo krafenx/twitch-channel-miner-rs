@@ -200,7 +200,7 @@ impl Notifier {
             _ => raw.to_string(),
         };
         if keep_html {
-            prefixed
+            escape_telegram_html(&prefixed)
         } else {
             strip_basic_html(&prefixed)
         }
@@ -311,25 +311,8 @@ impl Notifier {
                 && !mx.room_id.trim().is_empty()
                 && Self::accepts_event(&mx.events, event)
             {
-                if let Some(token) = self.ensure_matrix_token(mx).await {
-                    let text = self.format_message(message, false);
-                    let base = normalize_homeserver(&mx.homeserver);
-                    let encoded_room = urlencoding::encode(&mx.room_id);
-                    let url = format!(
-                        "{base}/_matrix/client/r0/rooms/{encoded_room}/send/m.room.message?access_token={}",
-                        urlencoding::encode(&token)
-                    );
-                    let _ = self
-                        .client
-                        .post(&url)
-                        .json(&serde_json::json!({
-                            "body": text,
-                            "msgtype": "m.text",
-                        }))
-                        .send()
-                        .await;
-                    debug!("Matrix notification sent ({event_name})");
-                }
+                let text = self.format_message(message, false);
+                self.send_matrix_message(mx, &text, event_name).await;
             }
         }
 
@@ -358,6 +341,45 @@ impl Notifier {
                     .await;
                 debug!("Pushover notification sent ({event_name})");
             }
+        }
+    }
+
+    async fn send_matrix_message(&self, mx: &MatrixConfig, text: &str, event_name: &str) {
+        let base = normalize_homeserver(&mx.homeserver);
+        let encoded_room = urlencoding::encode(&mx.room_id);
+
+        for attempt in 0..2 {
+            let Some(token) = self.ensure_matrix_token(mx).await else {
+                return;
+            };
+            let txn_id = uuid::Uuid::new_v4().to_string().replace('-', "");
+            let url = format!(
+                "{base}/_matrix/client/r0/rooms/{encoded_room}/send/m.room.message/{txn_id}?access_token={}",
+                urlencoding::encode(&token)
+            );
+            match self
+                .client
+                .put(&url)
+                .header("Authorization", format!("Bearer {token}"))
+                .json(&serde_json::json!({
+                    "body": text,
+                    "msgtype": "m.text",
+                }))
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().as_u16() == 401 || resp.status().as_u16() == 403 => {
+                    if attempt == 0 && !mx.username.trim().is_empty() && !mx.password.is_empty() {
+                        *self.matrix_token.lock().await = None;
+                        continue;
+                    }
+                }
+                Ok(_) => {
+                    debug!("Matrix notification sent ({event_name})");
+                }
+                Err(_) => {}
+            }
+            break;
         }
     }
 
@@ -420,6 +442,20 @@ fn normalize_homeserver(raw: &str) -> String {
     } else {
         format!("https://{trimmed}")
     }
+}
+
+fn escape_telegram_html(s: &str) -> String {
+    let escaped = s
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+    escaped
+        .replace("&lt;b&gt;", "<b>")
+        .replace("&lt;/b&gt;", "</b>")
+        .replace("&lt;i&gt;", "<i>")
+        .replace("&lt;/i&gt;", "</i>")
+        .replace("&lt;code&gt;", "<code>")
+        .replace("&lt;/code&gt;", "</code>")
 }
 
 fn strip_basic_html(s: &str) -> String {

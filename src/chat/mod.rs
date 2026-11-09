@@ -83,7 +83,7 @@ impl ChatClient {
                         break;
                     }
                     warn!(
-                        "IRC disconnected from #{}, reconnecting in 10s...",
+                        "IRC disconnected from #{}, reconnecting in 15s...",
                         self.channel
                     );
                 }
@@ -233,6 +233,7 @@ impl ChatPool {
     pub fn ensure_joined(&self, channel: &str) {
         let ch_lower = channel.to_lowercase();
         let mut handles = self.handles.lock().unwrap();
+        handles.retain(|(_, _, h)| !h.is_finished());
         if handles.iter().any(|(c, _, _)| c == &ch_lower) {
             return;
         }
