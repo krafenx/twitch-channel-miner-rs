@@ -1,14 +1,16 @@
-use crate::constants::{CLIENT_ID, USER_AGENT};
+use crate::constants::{CLIENT_ID, TV_USER_AGENT, USER_AGENT};
 use crate::error::{MinerError, Result};
+use crate::logger::SessionLogger;
 use chrono::{DateTime, Duration, Utc};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration as StdDuration;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct TwitchAuth {
     pub client_id: String,
     pub device_id: String,
@@ -16,6 +18,19 @@ pub struct TwitchAuth {
     pub user_id: Option<String>,
     pub username: String,
     pub client: Client,
+    pub disable_ssl_cert_verification: bool,
+    pub logger: Option<Arc<SessionLogger>>,
+}
+
+impl std::fmt::Debug for TwitchAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TwitchAuth")
+            .field("client_id", &self.client_id)
+            .field("device_id", &self.device_id)
+            .field("user_id", &self.user_id)
+            .field("username", &self.username)
+            .finish()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -30,8 +45,11 @@ struct DeviceCodeResponse {
 #[derive(Debug, Deserialize)]
 struct TokenResponse {
     access_token: String,
+    #[allow(dead_code)]
     refresh_token: Option<String>,
+    #[allow(dead_code)]
     expires_in: Option<u64>,
+    #[allow(dead_code)]
     token_type: Option<String>,
 }
 
@@ -46,10 +64,26 @@ struct SavedSession {
 
 impl TwitchAuth {
     pub fn new(username: &str) -> Result<Self> {
+        Self::with_options(username, false, None)
+    }
+
+    pub fn with_options(
+        username: &str,
+        disable_ssl_cert_verification: bool,
+        logger: Option<Arc<SessionLogger>>,
+    ) -> Result<Self> {
         let device_id = Uuid::new_v4().to_string().replace('-', "");
+        if disable_ssl_cert_verification {
+            if let Some(log) = &logger {
+                log.warn("SSL certificate verification is disabled! Be aware!");
+            } else {
+                warn!("SSL certificate verification is disabled! Be aware!");
+            }
+        }
         let client = Client::builder()
             .user_agent(USER_AGENT)
             .cookie_store(true)
+            .danger_accept_invalid_certs(disable_ssl_cert_verification)
             .build()?;
 
         Ok(Self {
@@ -59,7 +93,25 @@ impl TwitchAuth {
             user_id: None,
             username: username.to_string(),
             client,
+            disable_ssl_cert_verification,
+            logger,
         })
+    }
+
+    fn log_info(&self, emoji: &str, msg: &str) {
+        if let Some(log) = &self.logger {
+            log.info(emoji, msg);
+        } else {
+            info!("{msg}");
+        }
+    }
+
+    fn log_warn(&self, msg: &str) {
+        if let Some(log) = &self.logger {
+            log.warn(msg);
+        } else {
+            warn!("{msg}");
+        }
     }
 
     fn session_path(username: &str) -> PathBuf {
@@ -79,16 +131,15 @@ impl TwitchAuth {
         let data = std::fs::read_to_string(&path)?;
         let session: SavedSession = serde_json::from_str(&data)?;
 
-        // Simple check: consider session valid for 30 days (tokens last longer usually)
-        if Utc::now() - session.saved_at > Duration::days(30) {
-            warn!("Saved session is old, will re-login");
+        if Utc::now() - session.saved_at > Duration::days(60) {
+            self.log_warn("Saved session is older than 60 days, will re-validate / re-login");
             return Ok(false);
         }
 
         self.access_token = Some(session.access_token);
         self.user_id = Some(session.user_id);
         self.device_id = session.device_id;
-        info!("Loaded saved session for {}", self.username);
+        self.log_info("🍪", &format!("Loaded saved session for {}", self.username));
         Ok(true)
     }
 
@@ -113,31 +164,38 @@ impl TwitchAuth {
         let path = Self::session_path(&self.username);
         let data = serde_json::to_string_pretty(&session)?;
         std::fs::write(path, data)?;
-        info!("Session saved for {}", self.username);
+        self.log_info("💾", &format!("Session saved for {}", self.username));
         Ok(())
     }
 
-    /// Device Code OAuth flow (same as original TV login)
+    /// Device Code OAuth flow (same as original TV login in `TwitchLogin.py`)
     pub async fn login(&mut self) -> Result<()> {
         if self.load_session()? {
-            // Validate token quickly
             if self.validate_token().await.is_ok() {
                 return Ok(());
             }
-            warn!("Saved token is invalid, starting new login");
+            self.log_warn("Saved token is invalid or expired, starting new TV device login");
         }
 
-        info!("Starting Twitch device code login for {}", self.username);
-        info!("You will need to open a link and enter a code.");
+        self.log_info(
+            "🔑",
+            &format!("Starting Twitch TV device code login for {}", self.username),
+        );
 
         let device_resp = self
             .client
             .post("https://id.twitch.tv/oauth2/device")
+            .header("Accept", "application/json")
+            .header("Client-Id", &self.client_id)
+            .header("Origin", "https://android.tv.twitch.tv")
+            .header("Referer", "https://android.tv.twitch.tv/")
+            .header("User-Agent", TV_USER_AGENT)
+            .header("X-Device-Id", &self.device_id)
             .form(&[
                 ("client_id", self.client_id.as_str()),
                 (
                     "scopes",
-                    "channel_read chat:read user_blocks_edit user_blocks_read user_follows_edit user_read user:read:email",
+                    "channel_read chat:read user_blocks_edit user_blocks_read user_follows_edit user_read",
                 ),
             ])
             .send()
@@ -150,12 +208,14 @@ impl TwitchAuth {
             .verification_uri
             .unwrap_or_else(|| "https://www.twitch.tv/activate".to_string());
 
-        info!("======================================================");
-        info!("Open this URL in your browser:");
-        info!("  {}", verification);
-        info!("And enter the code: {}", device_resp.user_code);
-        info!("Code expires in {} minutes", device_resp.expires_in / 60);
-        info!("======================================================");
+        self.log_info("", "======================================================");
+        self.log_info("🌐", &format!("Open {verification} in your browser"));
+        self.log_info("🔢", &format!("And enter this code: {}", device_resp.user_code));
+        self.log_info(
+            "⏳",
+            &format!("Hurry up! It will expire in {} minutes!", device_resp.expires_in / 60),
+        );
+        self.log_info("", "======================================================");
 
         let expires_at = Utc::now() + Duration::seconds(device_resp.expires_in as i64);
         let interval = StdDuration::from_secs(device_resp.interval.max(5));
@@ -170,6 +230,12 @@ impl TwitchAuth {
             let token_resp = self
                 .client
                 .post("https://id.twitch.tv/oauth2/token")
+                .header("Accept", "application/json")
+                .header("Client-Id", &self.client_id)
+                .header("Origin", "https://android.tv.twitch.tv")
+                .header("Referer", "https://android.tv.twitch.tv/")
+                .header("User-Agent", TV_USER_AGENT)
+                .header("X-Device-Id", &self.device_id)
                 .form(&[
                     ("client_id", self.client_id.as_str()),
                     ("device_code", device_resp.device_code.as_str()),
@@ -181,10 +247,9 @@ impl TwitchAuth {
             if token_resp.status().is_success() {
                 let token: TokenResponse = token_resp.json().await?;
                 self.access_token = Some(token.access_token);
-                info!("Successfully obtained access token!");
+                self.log_info("✅", "Successfully obtained Twitch access token!");
                 break;
             } else {
-                // 400 usually means "authorization_pending"
                 let status = token_resp.status();
                 let body = token_resp.text().await.unwrap_or_default();
                 if !body.contains("authorization_pending") && !body.contains("slow_down") {
@@ -193,7 +258,6 @@ impl TwitchAuth {
             }
         }
 
-        // Fetch user id
         self.fetch_user_id().await?;
         self.save_session()?;
         Ok(())
@@ -237,7 +301,10 @@ impl TwitchAuth {
 
         if let Some(uid) = resp.get("user_id").and_then(|v| v.as_str()) {
             self.user_id = Some(uid.to_string());
-            info!("Logged in as {} (ID: {})", self.username, uid);
+            self.log_info(
+                "👤",
+                &format!("Logged in as {} (user_id={})", self.username, uid),
+            );
         } else {
             return Err(MinerError::Auth(
                 "Could not get user_id from validate".into(),

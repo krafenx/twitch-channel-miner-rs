@@ -6,6 +6,7 @@ pub mod config;
 pub mod constants;
 pub mod entities;
 pub mod error;
+pub mod logger;
 pub mod notify;
 pub mod settings;
 pub mod twitch;
