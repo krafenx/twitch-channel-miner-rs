@@ -1,51 +1,46 @@
 # Twitch Channel Points Miner (Rust)
 
-Rust-порт Twitch Channel Points Miner v2. В проекте есть CLI и нативное desktop-приложение на egui. Оба используют общий JSON-конфиг.
+Полнофункциональный Rust-порт [Twitch Channel Points Miner v2](https://github.com/rdavydov/Twitch-Channel-Points-Miner-v2) с CLI и нативным desktop-приложением на `egui`. Оба приложения используют единый обратно совместимый `config.json` и поддерживают одновременную работу нескольких Twitch-аккаунтов.
 
-## Запуск GUI
-
-```powershell
-cargo build --release --bins
-.\target-final\release\gui.exe
-```
-
-GUI позволяет добавлять несколько Twitch-аккаунтов и переключаться между ними. У каждого профиля свои каналы, настройки каналов, стратегии ставок, чат и уведомления. Запуск майнера запускает все заполненные профили одновременно. Первый вход каждого аккаунта проходит через device-code; ссылки и коды видны в общем журнале окна.
-
-Готовые Windows-бинарники этой сборки: `target-final/release/gui.exe` и `target-final/release/twitch-points-miner.exe`.
-
-В настройках канала блок «Автоставки: стратегия и сумма» задаёт выбор стороны, размер ставки как долю баланса, верхний лимит, порог баланса, фильтр и момент размещения. Правила ставок настраиваются отдельно для каждого канала. В блоке «Очередь выбора каналов» правила проверяются сверху вниз до заполнения лимита одновременного просмотра. Это отдельный порядок от ручного списка каналов: кнопки ↑/↓ у канала меняют его место в ручном списке, который использует правило «Ручной список каналов». Сортировка подписок применяется к загружаемым Twitch-подпискам.
-
-## Запуск CLI
-
-С настройками из GUI:
-
-```powershell
-.\target-final\release\twitch-points-miner.exe --config "$env:APPDATA\twitch-points-miner\config.json"
-```
-
-Либо передайте параметры напрямую:
-
-```powershell
-.\target-final\release\twitch-points-miner.exe -u YOUR_NICK -s streamer1,streamer2 --followers --chat online
-```
-
-Сборка обоих исполняемых файлов:
+## Сборка и запуск
 
 ```powershell
 cargo build --release --bins
 ```
 
-## Реализовано в текущем Rust-порте
+### Запуск GUI
 
-- Twitch device-code OAuth и сохранение сессии
-- Загрузка списка подписок, разрешение каналов, просмотр статуса и баланса очков
-- Автосбор бонусов и Drops, watch-streak, community goals и Moments
-- Spade/HLS minute-watched, IRC-присутствие и уведомления об упоминании
-- PubSub, автоматический переход по рейдам и ставки на Predictions
-- Стратегии ставок Smart, Most Voted, High Odds, Percentage, Smart Money и выбор варианта №1–8; фильтры ставок
-- Приоритеты каналов, общая HTTP-аналитика по всем аккаунтам с разделением по имени аккаунта, уведомления Telegram, Discord, HTTP webhook и Gotify
-- Редактирование каналов и поддерживаемых настроек в GUI; CLI принимает тот же JSON-конфиг через `--config`
+```powershell
+.\target\release\gui.exe
+```
 
-Полного соответствия оригиналу пока нет. Текущая сверка и список недостающих функций — в [FEATURE_PARITY.md](FEATURE_PARITY.md).
+GUI позволяет управлять несколькими профилями Twitch, задавать шаблон настроек каналов по умолчанию и индивидуальные правила для каждого стримера, настраивать стратегии ставок, приоритеты просмотра, логирование и все 6 сервисов уведомлений с фильтрацией по событиям.
 
-Конфиг GUI и сессии Twitch сохраняются в `%APPDATA%\twitch-points-miner\`. Токены уведомлений сейчас записываются в `config.json` как обычный текст.
+### Запуск CLI
+
+С общим JSON-конфигом:
+
+```powershell
+.\target\release\twitch-points-miner.exe --config "$env:APPDATA\twitch-points-miner\config.json"
+```
+
+Либо напрямую через аргументы командной строки:
+
+```powershell
+.\target\release\twitch-points-miner.exe -u YOUR_NICK -s streamer1,streamer2 --followers --followers-order asc --chat online
+```
+
+## Основные возможности
+
+- **Twitch TV Device-Code OAuth** с сохранением сессии, динамическим обновлением `Client-Version` (`__twilightBuildID`) и устойчивостью к обрывам сети.
+- **Автофарм баллов и бонусов**: симуляция просмотра (`minute-watched` через HLS + Spade), мгновенный сбор сундуков `+50` через PubSub (`claim-available`) и фоновая сверка контекста.
+- **Масштабируемый PubSub-пул**: автоматическое распределение подписок по нескольким WebSocket-соединениям (до 50 топиков на сокет), `PING`/`PONG` и обработка `RECONNECT`.
+- **Приоритеты просмотра**: `Streak` (Watch Streak), `Drops`, `Subscribed` (по множителю очков подписки), `Order`, `PointsAscending`, `PointsDescending`.
+- **Полноценные Twitch Drops**: синхронизация активных кампаний дашборда и инвентаря, учёт прогресса с прогресс-барами и автоматический сбор наград.
+- **Прогнозы (Predictions)**: живое обновление коэффициентов и `top_predictors` по `event-updated`, все 13 стратегий (`Smart`, `MostVoted`, `HighOdds`, `Percentage`, `SmartMoney`, `Number1`–`Number8`), `stealth_mode`, `FilterCondition` и учёт результатов (`predictions-user-v1`).
+- **Рейды, Moments, Community Goals и IRC-чат** (включая уведомления об упоминании `@username` и режим `disable_at_in_nickname`).
+- **6 каналов уведомлений** (**Telegram**, **Discord**, **HTTP Webhook** `GET`/`POST`, **Gotify**, **Matrix**, **Pushover**) с индивидуальной фильтрацией по всем 19 типам событий.
+- **Веб-аналитика**: интерактивный график очков, цветные аннотации событий, фильтр дат, переключение тёмной/светлой темы и вкладка live-логов (`/`, `/streamers`, `/json/<name>`, `/json_all`, `/log`).
+- **Гибкое логирование и финальный отчёт сессии** при остановке (`Ctrl+C`) с ротацией файлов логов, часовым поясом и цветовой палитрой.
+
+Подробная матрица соответствия оригинальному проекту — в [FEATURE_PARITY.md](FEATURE_PARITY.md).

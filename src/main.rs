@@ -1,17 +1,24 @@
+use chrono::Utc;
 use clap::Parser;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{info, Level};
 use tracing_subscriber::EnvFilter;
 use twitch_points_miner::analytics::Analytics;
 use twitch_points_miner::auth::TwitchAuth;
+use twitch_points_miner::bet::EventPredictionRecord;
 use twitch_points_miner::chat::{ChatPool, ChatPresence};
 use twitch_points_miner::config::{AccountConfig, AppConfig, FollowersOrder};
-use twitch_points_miner::entities::Streamer;
+use twitch_points_miner::entities::{Campaign, SharedStreamer, Streamer};
 use twitch_points_miner::error::{MinerError, Result};
-use twitch_points_miner::notify::{self, Notifier};
-use twitch_points_miner::settings::{MinerSettings, Priority};
+use twitch_points_miner::logger::SessionLogger;
+use twitch_points_miner::notify::{self, Notifier, WebhookMethod};
+use twitch_points_miner::settings::{millify_signed, MinerSettings, Priority};
+use twitch_points_miner::twitch::gql::GqlHeaders;
 use twitch_points_miner::twitch::{self, TwitchClient};
 use twitch_points_miner::ws::WebSocketPool;
+use uuid::Uuid;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -21,7 +28,7 @@ use twitch_points_miner::ws::WebSocketPool;
 struct Args {
     /// Load all settings from a JSON file (used by the desktop app)
     #[arg(long)]
-    config: Option<std::path::PathBuf>,
+    config: Option<PathBuf>,
 
     /// Twitch username
     #[arg(short, long)]
@@ -31,15 +38,23 @@ struct Args {
     #[arg(short, long, value_delimiter = ',')]
     streamers: Vec<String>,
 
+    /// Blacklisted streamers to ignore (comma separated)
+    #[arg(long, value_delimiter = ',')]
+    blacklist: Vec<String>,
+
     /// Also load and mine followed channels
     #[arg(long, default_value_t = false)]
     followers: bool,
+
+    /// Order for followed channels: asc or desc
+    #[arg(long, default_value = "asc")]
+    followers_order: String,
 
     /// Claim drops from inventory on startup
     #[arg(long, default_value_t = true)]
     claim_drops: bool,
 
-    /// Enable analytics HTTP dashboard
+    /// Enable analytics HTTP dashboard and JSON series persistence
     #[arg(long, default_value_t = true)]
     analytics: bool,
 
@@ -47,9 +62,45 @@ struct Args {
     #[arg(long, default_value = "127.0.0.1:9100")]
     analytics_bind: String,
 
+    /// Analytics auto-refresh interval in minutes
+    #[arg(long, default_value_t = 5)]
+    analytics_refresh: u64,
+
+    /// Default days shown in analytics chart
+    #[arg(long, default_value_t = 7)]
+    analytics_days_ago: u64,
+
     /// IRC chat presence: never, online, offline, always
     #[arg(long, default_value = "online")]
     chat: String,
+
+    /// Disable TLS certificate verification (use at your own risk)
+    #[arg(long, default_value_t = false)]
+    disable_ssl_verify: bool,
+
+    /// Match nickname mentions in chat even without '@' prefix
+    #[arg(long, default_value_t = false)]
+    disable_at_in_nickname: bool,
+
+    /// Concise log formatting (`less = true`)
+    #[arg(long, default_value_t = false)]
+    less: bool,
+
+    /// Suppress emojis in log output
+    #[arg(long, default_value_t = false)]
+    no_emoji: bool,
+
+    /// Disable ANSI colors in console output
+    #[arg(long, default_value_t = false)]
+    no_color: bool,
+
+    /// Disable saving logs to disk
+    #[arg(long, default_value_t = false)]
+    no_save_logs: bool,
+
+    /// Timezone for log timestamps (e.g. "+03:00" or "Europe/Moscow")
+    #[arg(long, default_value = "")]
+    time_zone: String,
 
     /// Telegram bot token
     #[arg(long)]
@@ -59,11 +110,15 @@ struct Args {
     #[arg(long)]
     telegram_chat: Option<String>,
 
+    /// Send Telegram notifications silently
+    #[arg(long, default_value_t = false)]
+    telegram_silent: bool,
+
     /// Discord webhook URL
     #[arg(long)]
     discord_webhook: Option<String>,
 
-    /// Gotify base URL
+    /// Gotify base URL or endpoint
     #[arg(long)]
     gotify_url: Option<String>,
 
@@ -71,9 +126,49 @@ struct Args {
     #[arg(long)]
     gotify_token: Option<String>,
 
+    /// Gotify message priority
+    #[arg(long, default_value_t = 5)]
+    gotify_priority: i32,
+
     /// Generic HTTP webhook URL
     #[arg(long)]
     webhook: Option<String>,
+
+    /// Webhook HTTP method: GET or POST
+    #[arg(long, default_value = "POST")]
+    webhook_method: String,
+
+    /// Matrix homeserver (e.g. matrix.org)
+    #[arg(long)]
+    matrix_homeserver: Option<String>,
+
+    /// Matrix room ID
+    #[arg(long)]
+    matrix_room: Option<String>,
+
+    /// Matrix username
+    #[arg(long)]
+    matrix_user: Option<String>,
+
+    /// Matrix password
+    #[arg(long)]
+    matrix_password: Option<String>,
+
+    /// Pushover user key
+    #[arg(long)]
+    pushover_user: Option<String>,
+
+    /// Pushover application token
+    #[arg(long)]
+    pushover_token: Option<String>,
+
+    /// Pushover priority (-2..=2)
+    #[arg(long, default_value_t = 0)]
+    pushover_priority: i32,
+
+    /// Pushover sound name
+    #[arg(long, default_value = "pushover")]
+    pushover_sound: String,
 }
 
 #[tokio::main]
@@ -81,7 +176,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::from_default_env()
-                .add_directive(Level::INFO.into())
+                .add_directive(Level::WARN.into())
                 .add_directive("tungstenite=warn".parse().unwrap())
                 .add_directive("tokio_tungstenite=warn".parse().unwrap())
                 .add_directive("reqwest=warn".parse().unwrap()),
@@ -90,263 +185,128 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    let mut cli_config = AppConfig::default();
-    cli_config.username = args.username.unwrap_or_default();
-    cli_config.streamers = args.streamers;
-    cli_config.followers = args.followers;
-    cli_config.claim_drops = args.claim_drops;
-    cli_config.analytics = args.analytics;
-    cli_config.analytics_bind = args.analytics_bind;
-    cli_config.chat = match args.chat.to_lowercase().as_str() {
+    let app_config = match args.config {
+        Some(path) => AppConfig::load(&path)
+            .map_err(|e| MinerError::Auth(format!("Could not load config: {e}")))?,
+        None => build_cli_config(args),
+    };
+
+    run_miner_app(app_config).await
+}
+
+fn build_cli_config(args: Args) -> AppConfig {
+    let mut cfg = AppConfig::default();
+    cfg.username = args.username.unwrap_or_default();
+    cfg.streamers = args.streamers;
+    cfg.blacklist = args.blacklist;
+    cfg.followers = args.followers;
+    cfg.followers_order = if args.followers_order.eq_ignore_ascii_case("desc") {
+        FollowersOrder::Descending
+    } else {
+        FollowersOrder::Ascending
+    };
+    cfg.claim_drops = args.claim_drops;
+    cfg.analytics = args.analytics;
+    cfg.analytics_bind = args.analytics_bind;
+    cfg.analytics_refresh_minutes = args.analytics_refresh;
+    cfg.analytics_days_ago = args.analytics_days_ago;
+    cfg.chat = match args.chat.to_lowercase().as_str() {
         "never" => ChatPresence::Never,
         "always" => ChatPresence::Always,
         "offline" => ChatPresence::Offline,
         _ => ChatPresence::Online,
     };
+    cfg.miner.claim_drops_startup = args.claim_drops;
+    cfg.miner.disable_ssl_cert_verification = args.disable_ssl_verify;
+    cfg.miner.disable_at_in_nickname = args.disable_at_in_nickname;
+
+    cfg.logger.less = args.less;
+    if args.no_emoji {
+        cfg.logger.emoji = false;
+    }
+    if args.no_color {
+        cfg.logger.colored = false;
+    }
+    if args.no_save_logs {
+        cfg.logger.save = false;
+    }
+    cfg.logger.time_zone = args.time_zone;
+
     if let (Some(token), Some(chat)) = (args.telegram_token, args.telegram_chat) {
-        cli_config.notifications.telegram = Some(notify::TelegramConfig {
+        cfg.notifications.telegram = Some(notify::TelegramConfig {
             bot_token: token,
             chat_id: chat,
+            disable_notification: args.telegram_silent,
+            ..Default::default()
         });
     }
     if let Some(url) = args.discord_webhook {
-        cli_config.notifications.discord = Some(notify::DiscordConfig { webhook_url: url });
-    }
-    if let Some(url) = args.webhook {
-        cli_config.notifications.webhook = Some(notify::WebhookConfig { url });
-    }
-    if let (Some(url), Some(token)) = (args.gotify_url, args.gotify_token) {
-        cli_config.notifications.gotify = Some(notify::GotifyConfig { url, token });
-    }
-    let app_config = match args.config {
-        Some(path) => AppConfig::load(&path)
-            .map_err(|e| MinerError::Auth(format!("Could not load config: {e}")))?,
-        None => cli_config,
-    };
-    if !app_config.accounts.is_empty() {
-        run_multi_accounts(app_config).await?;
-        return Ok(());
-    }
-    if app_config.username.trim().is_empty() {
-        return Err(MinerError::Auth(
-            "Set --username or configure a Twitch username in the app config".into(),
-        ));
-    }
-    let username = app_config.username.clone();
-    let miner_settings = app_config.miner.clone();
-
-    info!("🦀 Twitch Channel Points Miner (Rust port)");
-    info!("Session starting for user: {}", username);
-
-    // Notifications
-    let notifier = Notifier::new(app_config.notifications.clone());
-
-    // Analytics
-    let analytics = Arc::new(Analytics::new(
-        dirs::data_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join("twitch-points-miner"),
-    ));
-    if app_config.analytics {
-        let a = analytics.clone();
-        let bind = app_config.analytics_bind.clone();
-        tokio::spawn(async move {
-            a.serve(&bind).await;
+        cfg.notifications.discord = Some(notify::DiscordConfig {
+            webhook_url: url,
+            ..Default::default()
         });
     }
-
-    // Auth
-    let mut auth = TwitchAuth::new(&username)?;
-    auth.login().await?;
-
-    let token = auth.access_token.clone().unwrap();
-    let user_id = auth.user_id.clone().unwrap();
-    let device_id = auth.device_id.clone();
-    let http_client = auth.client.clone();
-
-    let client = TwitchClient::new(auth);
-
-    // Claim drops on startup
-    if app_config.claim_drops {
-        info!("Checking inventory for claimable drops...");
-        match client.claim_all_drops().await {
-            Ok(n) if n > 0 => {
-                info!("Claimed {} drops", n);
-                notifier.drop_claimed(&format!("{} drops", n)).await;
-            }
-            Ok(_) => info!("No claimable drops"),
-            Err(e) => tracing::warn!("Drops claim failed: {}", e),
-        }
+    if let Some(url) = args.webhook {
+        let method = if args.webhook_method.eq_ignore_ascii_case("get") {
+            WebhookMethod::Get
+        } else {
+            WebhookMethod::Post
+        };
+        cfg.notifications.webhook = Some(notify::WebhookConfig {
+            url,
+            method,
+            ..Default::default()
+        });
     }
-
-    // Build streamer list
-    let mut names = app_config.streamers.clone();
-    if app_config.followers {
-        info!("Loading followed channels...");
-        match twitch::gql::get_followers(
-            &http_client,
-            &token,
-            &device_id,
-            100,
-            match app_config.followers_order {
-                FollowersOrder::Ascending => "ASC",
-                FollowersOrder::Descending => "DESC",
-            },
-        )
-        .await
-        {
-            Ok(follows) => {
-                info!("Loaded {} followers", follows.len());
-                for f in follows {
-                    if !is_blacklisted(&f, &app_config.blacklist)
-                        && !names.iter().any(|n| n.eq_ignore_ascii_case(&f))
-                    {
-                        names.push(f);
-                    }
-                }
-            }
-            Err(e) => tracing::warn!("Failed to load followers: {}", e),
-        }
+    if let Some(url) = args.gotify_url {
+        cfg.notifications.gotify = Some(notify::GotifyConfig {
+            url,
+            token: args.gotify_token.unwrap_or_default(),
+            priority: args.gotify_priority,
+            ..Default::default()
+        });
     }
-
-    names.retain(|name| !is_blacklisted(name, &app_config.blacklist));
-    let mut streamers = Vec::new();
-    for name in &names {
-        let profile = app_config
-            .streamer_settings
-            .get(&name.to_lowercase())
-            .cloned()
-            .unwrap_or_default();
-        let mut s = Streamer::new(name).with_settings(profile);
-        if let Err(e) = client.resolve_streamer(&mut s).await {
-            tracing::error!("Failed to resolve {}: {}", name, e);
-            continue;
-        }
-        analytics.record(&username, &s.username, s.channel_points() as i64, "Start");
-        streamers.push(Arc::new(s));
-    }
-
-    if streamers.is_empty() {
-        tracing::error!("No valid streamers. Use -s streamer1,streamer2 or --followers");
-        return Ok(());
-    }
-
-    info!("Loaded {} streamers", streamers.len());
-
-    // IRC chat
-    let chat_presence = app_config.chat;
-    let chat_pool = ChatPool::new(&username, &token);
-    for s in &streamers {
-        if s.settings.chat.unwrap_or(chat_presence) == ChatPresence::Always {
-            chat_pool.ensure_joined(&s.username);
-        }
-    }
-
-    // WebSocket
-    let ws_pool = WebSocketPool::new(
-        token.clone(),
-        user_id,
-        device_id.clone(),
-        http_client.clone(),
-    );
-    for s in &streamers {
-        ws_pool.add_streamer(s.clone()).await;
-    }
-
-    let ws_handle = tokio::spawn(async move {
-        if let Err(e) = ws_pool.run().await {
-            tracing::error!("WS pool stopped: {}", e);
-        }
-    });
-
-    info!(
-        "Miner running (max {} concurrent). Analytics: http://{}",
-        miner_settings.max_watch_concurrent, app_config.analytics_bind
-    );
-    notifier
-        .send(&format!(
-            "🦀 Miner started for <b>{}</b> ({} streamers)",
+    if let (Some(homeserver), Some(room_id), Some(username), Some(password)) = (
+        args.matrix_homeserver,
+        args.matrix_room,
+        args.matrix_user,
+        args.matrix_password,
+    ) {
+        cfg.notifications.matrix = Some(notify::MatrixConfig {
             username,
-            streamers.len()
-        ))
-        .await;
-
-    let mut tick = 0u64;
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(
-        miner_settings.watch_interval_secs,
-    ));
-
-    loop {
-        tokio::select! {
-            _ = interval.tick() => {
-                tick += 1;
-
-                // Refresh online status + chat presence
-                if tick % (miner_settings.status_refresh_secs / miner_settings.watch_interval_secs).max(1) == 0 {
-                    for s in &streamers {
-                        let _ = client.update_stream_status(s).await;
-                        let online = s.is_online();
-                        match s.settings.chat.unwrap_or(chat_presence) {
-                            ChatPresence::Always => chat_pool.ensure_joined(&s.username),
-                            ChatPresence::Online if online => chat_pool.ensure_joined(&s.username),
-                            ChatPresence::Offline if !online => chat_pool.ensure_joined(&s.username),
-                            _ => chat_pool.leave(&s.username),
-                        }
-                        // Community goals when online
-                        if online {
-                            let _ = client.contribute_community_goals(s).await;
-                        }
-                        // Record balance
-                        analytics.record(&username, &s.username, s.channel_points() as i64, "Watch");
-                    }
-                }
-
-                // Periodic drops claim
-                if tick % (miner_settings.drops_claim_interval_secs / miner_settings.watch_interval_secs).max(1) == 0 {
-                    if let Ok(n) = client.claim_all_drops().await {
-                        if n > 0 {
-                            notifier.drop_claimed(&format!("{} drops", n)).await;
-                        }
-                    }
-                }
-
-                let selected = select_streamers_to_watch(&streamers, &miner_settings);
-
-                if selected.is_empty() {
-                    if tick % 12 == 0 {
-                        info!("No online streamers right now...");
-                    }
-                    continue;
-                }
-
-                for s in selected {
-                    if let Err(e) = client.send_minute_watched(s).await {
-                        tracing::debug!("minute-watched error for {}: {}", s.username, e);
-                    } else {
-                        analytics.record(&username, &s.username, s.channel_points() as i64, "Watch");
-                    }
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                }
-            }
-            _ = tokio::signal::ctrl_c() => {
-                info!("Shutting down...");
-                chat_pool.leave_all();
-                notifier.send("🛑 Miner stopped").await;
-                break;
-            }
-        }
+            password,
+            homeserver,
+            room_id,
+            ..Default::default()
+        });
     }
-
-    ws_handle.abort();
-    info!("Bye!");
-    Ok(())
+    if let (Some(userkey), Some(token)) = (args.pushover_user, args.pushover_token) {
+        cfg.notifications.pushover = Some(notify::PushoverConfig {
+            userkey,
+            token,
+            priority: args.pushover_priority,
+            sound: args.pushover_sound,
+            ..Default::default()
+        });
+    }
+    cfg
 }
 
-async fn run_multi_accounts(app_config: AppConfig) -> Result<()> {
-    let accounts = app_config.effective_accounts();
+async fn run_miner_app(app_config: AppConfig) -> Result<()> {
+    let mut accounts = app_config.effective_accounts();
     if accounts.is_empty() {
-        return Err(MinerError::Auth("No configured Twitch accounts".into()));
+        return Err(MinerError::Auth(
+            "Set --username or configure at least one Twitch username in the app config".into(),
+        ));
     }
+
+    // If multiple accounts are running simultaneously, automatically enable `[username]` prefix
+    if accounts.len() > 1 {
+        for acc in &mut accounts {
+            acc.logger.console_username = true;
+        }
+    }
+
     let mut seen = std::collections::HashSet::new();
     for account in &accounts {
         if !seen.insert(account.username.to_lowercase()) {
@@ -357,31 +317,42 @@ async fn run_multi_accounts(app_config: AppConfig) -> Result<()> {
         }
     }
 
-    let analytics = Arc::new(Analytics::new(
-        dirs::data_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join("twitch-points-miner"),
-    ));
-    if app_config.analytics {
+    let data_dir = dirs::data_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("twitch-points-miner");
+
+    let analytics_opt: Option<Arc<Analytics>> = if app_config.analytics {
+        let analytics = Arc::new(Analytics::with_options(
+            &data_dir,
+            app_config.analytics_refresh_minutes,
+            app_config.analytics_days_ago,
+        ));
         let server = Arc::clone(&analytics);
         let bind = app_config.analytics_bind.clone();
         tokio::spawn(async move {
             server.serve(&bind).await;
         });
+        Some(analytics)
+    } else {
+        None
+    };
+
+    if accounts.len() > 1 {
+        info!("Starting {} Twitch account(s)", accounts.len());
     }
 
-    info!("Starting {} Twitch account(s)", accounts.len());
     let bind = app_config.analytics_bind.clone();
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let mut workers = tokio::task::JoinSet::new();
     for account in accounts {
-        let analytics = Arc::clone(&analytics);
+        let analytics = analytics_opt.clone();
         let bind = bind.clone();
+        let data_dir = data_dir.clone();
         let shutdown = shutdown_rx.clone();
         workers.spawn(async move {
             let username = account.username.clone();
-            if let Err(error) = run_account(account, analytics, bind, shutdown).await {
-                tracing::error!("Account {} stopped with error: {}", username, error);
+            if let Err(error) = run_account(account, data_dir, analytics, bind, shutdown).await {
+                eprintln!("Account {} stopped with error: {}", username, error);
             }
         });
     }
@@ -391,19 +362,21 @@ async fn run_multi_accounts(app_config: AppConfig) -> Result<()> {
         tokio::select! {
             signal = tokio::signal::ctrl_c() => {
                 signal?;
-                info!("Stopping all account sessions...");
+                println!("\nCTRL+C Detected! Please wait just a moment!");
                 let _ = shutdown_tx.send(true);
                 break;
             }
             Some(result) = workers.join_next() => {
                 running -= 1;
-                if let Err(error) = result { tracing::error!("Account task failed: {}", error); }
+                if let Err(error) = result {
+                    eprintln!("Account task failed: {}", error);
+                }
             }
         }
     }
     while let Some(result) = workers.join_next().await {
         if let Err(error) = result {
-            tracing::error!("Account task failed: {}", error);
+            eprintln!("Account task failed: {}", error);
         }
     }
     Ok(())
@@ -411,40 +384,80 @@ async fn run_multi_accounts(app_config: AppConfig) -> Result<()> {
 
 async fn run_account(
     account: AccountConfig,
-    analytics: Arc<Analytics>,
+    data_dir: PathBuf,
+    analytics: Option<Arc<Analytics>>,
     analytics_bind: String,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
+    let session_id = Uuid::new_v4().to_string();
+    let start_utc = Utc::now();
     let username = account.username.clone();
     let settings = account.miner.clone();
-    let notifier = Notifier::new(account.notifications.clone());
-    info!("Account {}: starting Twitch login", username);
 
-    let mut auth = TwitchAuth::new(&username)?;
+    let username_prefix = if account.logger.console_username {
+        Some(username.clone())
+    } else {
+        None
+    };
+    let notifier = Arc::new(Notifier::with_options(
+        account.notifications.clone(),
+        settings.disable_ssl_cert_verification,
+        username_prefix,
+    ));
+    let logger = Arc::new(SessionLogger::new(
+        &username,
+        account.logger.clone(),
+        &data_dir,
+        Arc::clone(&notifier),
+    ));
+
+    logger.info("💣", &format!("Start session: '{session_id}'"));
+
+    // Authenticate via Twitch TV Device Code OAuth
+    let mut auth = TwitchAuth::with_options(
+        &username,
+        settings.disable_ssl_cert_verification,
+        Some(Arc::clone(&logger)),
+    )?;
     auth.login().await?;
+
     let token = auth.access_token.clone().unwrap();
     let user_id = auth.user_id.clone().unwrap();
-    let device_id = auth.device_id.clone();
-    let http_client = auth.client.clone();
-    let client = TwitchClient::new(auth);
+    if user_id.is_empty() {
+        return Err(MinerError::Auth("Empty user_id returned by Twitch".into()));
+    }
 
-    if account.claim_drops {
+    let client = Arc::new(TwitchClient::with_context(
+        auth,
+        Some(Arc::clone(&logger)),
+        analytics.clone(),
+    ));
+    client.refresh_client_version().await;
+
+    // Claim drops on startup
+    if account.claim_drops && settings.claim_drops_startup {
+        logger.info("🎁", "Checking inventory for claimable drops...");
         match client.claim_all_drops().await {
-            Ok(n) if n > 0 => {
-                info!("Account {}: claimed {} Drops", username, n);
-                notifier.drop_claimed(&format!("{} drops", n)).await;
-            }
-            Ok(_) => info!("Account {}: no claimable Drops", username),
-            Err(error) => tracing::warn!("Account {}: claim Drops failed: {}", username, error),
+            Ok(n) if n > 0 => logger.info("📦", &format!("Claimed {n} drop(s) on startup")),
+            Ok(_) => logger.debug("No claimable drops on startup"),
+            Err(error) => logger.warn(&format!("Startup drops claim failed: {error}")),
         }
     }
 
+    // Build streamer list (manual list + optional followed channels - blacklist)
     let mut names = account.streamers.clone();
     if account.followers {
-        match twitch::gql::get_followers(
-            &http_client,
-            &token,
-            &device_id,
+        logger.info("📋", "Loading followed channels...");
+        let ver = client.current_client_version();
+        let headers = GqlHeaders {
+            auth_token: &token,
+            device_id: &client.auth.device_id,
+            client_version: &ver,
+            client_session_id: Some(&client.client_session_id),
+        };
+        match twitch::gql::get_followers_ext(
+            &client.auth.client,
+            &headers,
             100,
             match account.followers_order {
                 FollowersOrder::Ascending => "ASC",
@@ -454,11 +467,7 @@ async fn run_account(
         .await
         {
             Ok(follows) => {
-                info!(
-                    "Account {}: loaded {} followed channels",
-                    username,
-                    follows.len()
-                );
+                logger.info("📋", &format!("Loaded {} followed channels", follows.len()));
                 for name in follows {
                     if !is_blacklisted(&name, &account.blacklist)
                         && !names.iter().any(|item| item.eq_ignore_ascii_case(&name))
@@ -467,84 +476,170 @@ async fn run_account(
                     }
                 }
             }
-            Err(error) => tracing::warn!("Account {}: loading follows failed: {}", username, error),
+            Err(error) => logger.warn(&format!("Loading follows failed: {error}")),
         }
     }
     names.retain(|name| !is_blacklisted(name, &account.blacklist));
 
-    let mut streamers = Vec::new();
+    logger.info(
+        "🤓",
+        &format!("Loading data for {} streamers. Please wait ...", names.len()),
+    );
+
+    let mut streamers: Vec<SharedStreamer> = Vec::new();
     for name in &names {
+        let delay_ms: u64 = {
+            use rand::Rng;
+            rand::thread_rng().gen_range(250..=550)
+        };
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+
         let profile = account
             .streamer_settings
             .get(&name.to_lowercase())
             .cloned()
-            .unwrap_or_default();
+            .unwrap_or_else(|| account.default_streamer_settings.clone());
+
         let mut streamer = Streamer::new(name).with_settings(profile);
-        if let Err(error) = client.resolve_streamer(&mut streamer).await {
-            tracing::error!(
-                "Account {}: failed to resolve {}: {}",
-                username,
-                name,
-                error
-            );
-            continue;
+        match client.resolve_streamer(&mut streamer).await {
+            Ok(()) => {
+                if let Some(a) = &analytics {
+                    a.record(
+                        &username,
+                        &streamer.username,
+                        streamer.channel_points() as i64,
+                        "Start",
+                    );
+                }
+                streamers.push(Arc::new(streamer));
+            }
+            Err(MinerError::StreamerNotFound(_)) => {
+                logger.info("😢", &format!("Streamer {name} does not exist"));
+            }
+            Err(error) => {
+                logger.error(&format!("Failed to resolve {name}: {error}"));
+            }
         }
-        analytics.record(
-            &username,
-            &streamer.username,
-            streamer.channel_points() as i64,
-            "Start",
-        );
-        streamers.push(Arc::new(streamer));
     }
+
     if streamers.is_empty() {
-        tracing::warn!(
-            "Account {}: no valid streamers; skipping this account",
-            username
-        );
+        logger.warn("No valid streamers found; stopping session.");
         return Ok(());
     }
 
+    // IRC chat pool
     let chat_presence = account.chat;
-    let chat_pool = ChatPool::new(&username, &token);
+    let chat_pool = Arc::new(ChatPool::with_options(
+        &username,
+        &token,
+        settings.disable_at_in_nickname,
+        Some(Arc::clone(&logger)),
+    ));
     for streamer in &streamers {
-        if streamer.settings.chat.unwrap_or(chat_presence) == ChatPresence::Always {
-            chat_pool.ensure_joined(&streamer.username);
+        let online = streamer.is_online();
+        match streamer.settings.chat.unwrap_or(chat_presence) {
+            ChatPresence::Always => chat_pool.ensure_joined(&streamer.username),
+            ChatPresence::Online if online => chat_pool.ensure_joined(&streamer.username),
+            ChatPresence::Offline if !online => chat_pool.ensure_joined(&streamer.username),
+            _ => {}
         }
     }
 
-    let ws_pool = WebSocketPool::new(token.clone(), user_id, device_id, http_client);
+    // Background Drop campaigns & inventory sync (ported from `sync_campaigns_thread`)
+    let any_drops = streamers.iter().any(|s| s.settings.claim_drops);
+    let campaigns_handle = if any_drops {
+        let camp_client = Arc::clone(&client);
+        let camp_streamers = streamers.clone();
+        let dash_interval = settings.drops_claim_interval_secs.max(300);
+        Some(tokio::spawn(async move {
+            let mut cached_campaigns: Vec<Campaign> = Vec::new();
+            let mut last_dash = std::time::Instant::now()
+                .checked_sub(Duration::from_secs(dash_interval + 1))
+                .unwrap_or_else(std::time::Instant::now);
+            let mut ticker = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                ticker.tick().await;
+                let refresh_dash = last_dash.elapsed() >= Duration::from_secs(dash_interval);
+                if refresh_dash {
+                    last_dash = std::time::Instant::now();
+                }
+                if let Err(e) = camp_client
+                    .sync_campaigns_once(&camp_streamers, refresh_dash, &mut cached_campaigns)
+                    .await
+                {
+                    camp_client.log_warn(&format!("Error while syncing campaigns/inventory: {e}"));
+                    camp_client.wait_for_internet().await;
+                }
+            }
+        }))
+    } else {
+        None
+    };
+
+    // Multi-socket PubSub WebSocket pool (<=50 topics per socket)
+    let ws_pool = Arc::new(WebSocketPool::with_client(
+        Arc::clone(&client),
+        user_id,
+        username.clone(),
+        Some(Arc::clone(&chat_pool)),
+        chat_presence,
+    ));
     for streamer in &streamers {
-        ws_pool.add_streamer(streamer.clone()).await;
+        ws_pool.add_streamer(Arc::clone(streamer)).await;
     }
-    let ws_username = username.clone();
+    let ws_runner = Arc::clone(&ws_pool);
+    let ws_logger = Arc::clone(&logger);
     let ws_handle = tokio::spawn(async move {
-        if let Err(error) = ws_pool.run().await {
-            tracing::error!("Account {} WebSocket pool stopped: {}", ws_username, error);
+        if let Err(error) = ws_runner.run().await {
+            ws_logger.error(&format!("WebSocket pool stopped: {error}"));
         }
     });
 
-    info!(
-        "Account {}: running with {} streamers; analytics at http://{}",
-        username,
-        streamers.len(),
-        analytics_bind
-    );
+    if analytics.is_some() {
+        logger.info(
+            "🌐",
+            &format!(
+                "Miner running ({} streamers, max {} concurrent). Analytics: http://{}/",
+                streamers.len(),
+                settings.max_watch_concurrent,
+                analytics_bind
+            ),
+        );
+    } else {
+        logger.info(
+            "🦀",
+            &format!(
+                "Miner running ({} streamers, max {} concurrent).",
+                streamers.len(),
+                settings.max_watch_concurrent
+            ),
+        );
+    }
+
     notifier
         .send(&format!(
-            "Miner started for <b>{}</b> ({} streamers)",
+            "🦀 Miner started for <b>{}</b> ({} streamers)",
             username,
             streamers.len()
         ))
         .await;
-    let mut tick = 0u64;
-    let mut interval =
-        tokio::time::interval(std::time::Duration::from_secs(settings.watch_interval_secs));
+
+    let watch_base_secs = settings.watch_interval_secs.max(10);
+    let mut last_status_refresh = std::time::Instant::now();
+    let mut last_context_refresh = std::time::Instant::now();
+    let mut idle_ticks = 0u64;
+
     loop {
         tokio::select! {
-            _ = interval.tick() => {
-                tick += 1;
-                if tick % (settings.status_refresh_secs / settings.watch_interval_secs).max(1) == 0 {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                // 1. Periodic stream online/offline check + IRC chat sync
+                if last_status_refresh.elapsed() >= Duration::from_secs(settings.status_refresh_secs.max(30)) {
+                    last_status_refresh = std::time::Instant::now();
                     for streamer in &streamers {
                         let _ = client.update_stream_status(streamer).await;
                         let online = streamer.is_online();
@@ -554,41 +649,159 @@ async fn run_account(
                             ChatPresence::Offline if !online => chat_pool.ensure_joined(&streamer.username),
                             _ => chat_pool.leave(&streamer.username),
                         }
-                        if online { let _ = client.contribute_community_goals(streamer).await; }
-                        analytics.record(&username, &streamer.username, streamer.channel_points() as i64, "Watch");
                     }
                 }
-                if tick % (settings.drops_claim_interval_secs / settings.watch_interval_secs).max(1) == 0 {
-                    if let Ok(n) = client.claim_all_drops().await {
-                        if n > 0 { notifier.drop_claimed(&format!("{} drops", n)).await; }
+
+                // 2. Periodic ChannelPointsContext refresh every 30m on online channels (matches upstream)
+                if last_context_refresh.elapsed() >= Duration::from_secs(settings.context_refresh_secs.max(300)) {
+                    last_context_refresh = std::time::Instant::now();
+                    client.refresh_client_version().await;
+                    for streamer in &streamers {
+                        if streamer.is_online() {
+                            client.load_channel_points_context(streamer).await;
+                        }
                     }
                 }
-                let selected = select_streamers_to_watch(&streamers, &settings);
+
+                // 3. Select channels by priority and send minute-watched
+                let selected: Vec<SharedStreamer> = select_streamers_to_watch(&streamers, &settings)
+                    .into_iter()
+                    .cloned()
+                    .collect();
                 if selected.is_empty() {
-                    if tick % 12 == 0 { info!("Account {}: no online streamers", username); }
+                    idle_ticks += 1;
+                    if idle_ticks % 12 == 1 {
+                        logger.debug("No online streamers eligible right now...");
+                    }
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_secs(watch_base_secs)) => {}
+                        _ = shutdown.changed() => { break; }
+                    }
                     continue;
                 }
-                for streamer in selected {
-                    if let Err(error) = client.send_minute_watched(streamer).await {
-                        tracing::debug!("Account {}: minute-watched failed for {}: {}", username, streamer.username, error);
-                    } else {
-                        analytics.record(&username, &streamer.username, streamer.channel_points() as i64, "Watch");
+                idle_ticks = 0;
+
+                let per_streamer_pause =
+                    (watch_base_secs as f64 / selected.len().max(1) as f64).max(2.0);
+
+                for streamer in &selected {
+                    let iter_start = std::time::Instant::now();
+                    match client.send_minute_watched(streamer).await {
+                        Ok(()) => {
+                            if let Some(a) = &analytics {
+                                a.record(
+                                    &username,
+                                    &streamer.username,
+                                    streamer.channel_points() as i64,
+                                    "Watch",
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            logger.debug(&format!(
+                                "minute-watched failed for {}: {}",
+                                streamer.username, error
+                            ));
+                        }
                     }
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                }
-            }
-            changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() {
-                    chat_pool.leave_all();
-                    notifier.send("Miner stopped").await;
-                    break;
+                    let remaining = Duration::from_secs_f64(per_streamer_pause)
+                        .saturating_sub(iter_start.elapsed());
+                    if !remaining.is_zero() {
+                        tokio::select! {
+                            _ = tokio::time::sleep(remaining) => {}
+                            _ = shutdown.changed() => { break; }
+                        }
+                    }
+                    if *shutdown.borrow() {
+                        break;
+                    }
                 }
             }
         }
     }
+
+    // Graceful shutdown & Final Session Report
+    chat_pool.leave_all();
     ws_handle.abort();
-    info!("Account {}: session stopped", username);
+    if let Some(ch) = campaigns_handle {
+        ch.abort();
+    }
+
+    let predictions = ws_pool.prediction_records().await;
+    print_session_report(&logger, &session_id, start_utc, &streamers, &predictions);
+
+    notifier.send("🛑 Miner stopped").await;
     Ok(())
+}
+
+/// Ported from `TwitchChannelPointsMiner.__print_report()`
+fn print_session_report(
+    logger: &SessionLogger,
+    session_id: &str,
+    start_utc: chrono::DateTime<Utc>,
+    streamers: &[SharedStreamer],
+    predictions: &[EventPredictionRecord],
+) {
+    println!();
+    logger.info("🛑", &format!("Ending session: '{session_id}'"));
+    if let Some(path) = logger.log_file_path() {
+        logger.info("📄", &format!("Logs file: {}", path.display()));
+    }
+    let elapsed = Utc::now() - start_utc;
+    let total_secs = elapsed.num_seconds().max(0);
+    let hours = total_secs / 3600;
+    let mins = (total_secs % 3600) / 60;
+    let secs = total_secs % 60;
+    logger.info(
+        "⌛",
+        &format!("Duration {:02}:{:02}:{:02}", hours, mins, secs),
+    );
+
+    let less = logger.settings.less;
+    if !less && !predictions.is_empty() {
+        let confirmed: Vec<&EventPredictionRecord> = predictions
+            .iter()
+            .filter(|p| p.bet_confirmed || p.bet_placed)
+            .collect();
+        if !confirmed.is_empty() {
+            println!();
+            for pred in confirmed {
+                logger.info("🔧", &pred.settings.summary());
+                if let Some(fc) = &pred.settings.filter_condition {
+                    logger.info("📌", &fc.summary());
+                }
+                logger.info("📊", &pred.print_recap(less));
+            }
+        }
+    }
+
+    println!();
+    for streamer in streamers {
+        if streamer.has_history() {
+            let gained = streamer.channel_points() as i64 - streamer.initial_points() as i64;
+            let header = if less {
+                format!(
+                    "{}, Total Points Gained: {}",
+                    streamer.display_str(true),
+                    millify_signed(gained)
+                )
+            } else {
+                format!(
+                    "{}, Total Points Gained (after farming - before farming): {}",
+                    streamer.display_str(false),
+                    millify_signed(gained)
+                )
+            };
+            let indent = " ".repeat(25);
+            let hist_lines = streamer
+                .print_history()
+                .split("; ")
+                .map(|part| format!("{indent}{part}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            logger.info("💰", &format!("{header}\n{hist_lines}"));
+        }
+    }
 }
 
 fn is_blacklisted(name: &str, blacklist: &[String]) -> bool {
@@ -598,16 +811,19 @@ fn is_blacklisted(name: &str, blacklist: &[String]) -> bool {
 }
 
 fn select_streamers_to_watch<'a>(
-    streamers: &'a [Arc<Streamer>],
+    streamers: &'a [SharedStreamer],
     settings: &MinerSettings,
-) -> Vec<&'a Arc<Streamer>> {
-    let online: Vec<&Arc<Streamer>> = streamers.iter().filter(|s| s.is_online()).collect();
+) -> Vec<&'a SharedStreamer> {
+    let online: Vec<&SharedStreamer> = streamers
+        .iter()
+        .filter(|s| s.ready_for_minute_watched())
+        .collect();
     if online.is_empty() {
         return vec![];
     }
 
-    let mut selected: Vec<&Arc<Streamer>> = Vec::new();
-    let max = settings.max_watch_concurrent;
+    let mut selected: Vec<&SharedStreamer> = Vec::new();
+    let max = settings.max_watch_concurrent.max(1);
 
     for prio in &settings.priority {
         if selected.len() >= max {
@@ -629,12 +845,28 @@ fn select_streamers_to_watch<'a>(
                     if selected.len() >= max {
                         break;
                     }
-                    if s.settings.claim_drops && !selected.iter().any(|x| x.username == s.username)
-                    {
-                        let has_game = s.stream.lock().unwrap().game_id.is_some();
-                        if has_game {
-                            selected.push(*s);
-                        }
+                    if s.drops_condition() && !selected.iter().any(|x| x.username == s.username) {
+                        selected.push(*s);
+                    }
+                }
+            }
+            Priority::Subscribed => {
+                let mut mult_streamers: Vec<&SharedStreamer> = online
+                    .iter()
+                    .copied()
+                    .filter(|s| s.viewer_has_points_multiplier())
+                    .collect();
+                mult_streamers.sort_by(|a, b| {
+                    b.total_points_multiplier()
+                        .partial_cmp(&a.total_points_multiplier())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                for s in mult_streamers {
+                    if selected.len() >= max {
+                        break;
+                    }
+                    if !selected.iter().any(|x| x.username == s.username) {
+                        selected.push(s);
                     }
                 }
             }
@@ -669,16 +901,6 @@ fn select_streamers_to_watch<'a>(
                     }
                     if !selected.iter().any(|x| x.username == s.username) {
                         selected.push(s);
-                    }
-                }
-            }
-            Priority::Subscribed => {
-                for s in &online {
-                    if selected.len() >= max {
-                        break;
-                    }
-                    if !selected.iter().any(|x| x.username == s.username) {
-                        selected.push(*s);
                     }
                 }
             }
