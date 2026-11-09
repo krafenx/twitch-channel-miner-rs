@@ -155,6 +155,7 @@ impl SessionLogger {
         base_dir: impl AsRef<Path>,
         notifier: Arc<Notifier>,
     ) -> Self {
+        let today = current_date_for_tz(&settings.time_zone);
         let file_state = if settings.save {
             let logs_dir = base_dir.as_ref().join("logs");
             let _ = fs::create_dir_all(&logs_dir);
@@ -164,7 +165,18 @@ impl SessionLogger {
                 username
             });
             let log_path = logs_dir.join(format!("{safe_name}.log"));
-            let today = Utc::now().date_naive();
+            // Rotate stale log file from a previous day on startup
+            if let Ok(meta) = fs::metadata(&log_path) {
+                if meta.len() > 0 {
+                    if let Ok(modified) = meta.modified() {
+                        let mod_utc: DateTime<Utc> = modified.into();
+                        let file_date = date_for_tz(mod_utc, &settings.time_zone);
+                        if file_date != today {
+                            rotate_log_file(&log_path, file_date);
+                        }
+                    }
+                }
+            }
             if settings.auto_clear {
                 prune_old_logs(&logs_dir, &safe_name, 7);
             }
@@ -307,21 +319,11 @@ impl SessionLogger {
             return;
         };
 
-        let today = Utc::now().date_naive();
+        let today = current_date_for_tz(&self.settings.time_zone);
         if today != state.current_date {
             // Rotate current file to `<name>.log.YYYY-MM-DD`
             state.file.take();
-            let rotated_name = format!(
-                "{}.{}",
-                state
-                    .log_path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("miner.log"),
-                state.current_date.format("%Y-%m-%d")
-            );
-            let rotated_path = state.log_path.with_file_name(rotated_name);
-            let _ = fs::rename(&state.log_path, &rotated_path);
+            rotate_log_file(&state.log_path, state.current_date);
             state.current_date = today;
             state.file = OpenOptions::new()
                 .create(true)
@@ -359,6 +361,40 @@ pub fn sanitize_filename(value: &str) -> String {
             }
         })
         .collect()
+}
+
+fn date_for_tz(ts: DateTime<Utc>, tz: &str) -> NaiveDate {
+    if let Some(offset) = parse_timezone_offset(tz) {
+        ts.with_timezone(&offset).date_naive()
+    } else {
+        ts.with_timezone(&Local).date_naive()
+    }
+}
+
+fn current_date_for_tz(tz: &str) -> NaiveDate {
+    date_for_tz(Utc::now(), tz)
+}
+
+fn rotate_log_file(log_path: &Path, file_date: NaiveDate) {
+    let rotated_name = format!(
+        "{}.{}",
+        log_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("miner.log"),
+        file_date.format("%Y-%m-%d")
+    );
+    let rotated_path = log_path.with_file_name(rotated_name);
+    if rotated_path.exists() {
+        if let Ok(existing) = fs::read(log_path) {
+            if let Ok(mut dst) = OpenOptions::new().append(true).open(&rotated_path) {
+                let _ = dst.write_all(&existing);
+            }
+            let _ = fs::remove_file(log_path);
+        }
+    } else {
+        let _ = fs::rename(log_path, &rotated_path);
+    }
 }
 
 fn prune_old_logs(dir: &Path, safe_username: &str, keep_backups: usize) {

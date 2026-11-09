@@ -97,6 +97,7 @@ impl MinerApp {
         match Command::new(executable)
             .arg("--config")
             .arg(&self.config_path)
+            .arg("--no-color")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -189,6 +190,12 @@ impl MinerApp {
         }
         self.config.load_legacy_fields(self.selected_account);
         self.blacklist_input = self.config.blacklist.join(", ");
+    }
+}
+
+impl Drop for MinerApp {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
@@ -1085,12 +1092,32 @@ fn forward_output<R: Read + Send + 'static>(output: Option<R>, tx: mpsc::Sender<
     if let Some(output) = output {
         std::thread::spawn(move || {
             for line in BufReader::new(output).lines().map_while(Result::ok) {
-                if tx.send(line).is_err() {
+                if tx.send(strip_ansi_codes(&line)).is_err() {
                     break;
                 }
             }
         });
     }
+}
+
+fn strip_ansi_codes(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                while let Some(c) = chars.next() {
+                    if ('@'..='~').contains(&c) {
+                        break;
+                    }
+                }
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 fn strategy_label(strategy: Strategy) -> &'static str {

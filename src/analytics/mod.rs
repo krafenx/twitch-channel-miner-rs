@@ -102,7 +102,7 @@ impl Analytics {
         });
         let formatted_kind = format_reason_label(kind);
         entry.series.push(AnalyticsEvent {
-            x: (Utc::now().timestamp() * 1000),
+            x: Utc::now().timestamp_millis(),
             y: points,
             z: formatted_kind,
             streamer: streamer.to_string(),
@@ -137,7 +137,7 @@ impl Analytics {
             annotations: Vec::new(),
         });
         entry.annotations.push(AnalyticsAnnotation {
-            x: (Utc::now().timestamp() * 1000),
+            x: Utc::now().timestamp_millis(),
             border_color: primary_color.to_string(),
             label: AnnotationLabel {
                 style: AnnotationStyle {
@@ -270,11 +270,11 @@ impl Analytics {
             return (String::new(), 0);
         };
         let total = content.len();
-        if last_index >= total {
+        if last_index == total {
             return (String::new(), total);
         }
-        // Ensure valid UTF-8 char boundary
-        let mut idx = last_index;
+        // If log file rotated / shrank, restart from byte 0
+        let mut idx = if last_index > total { 0 } else { last_index };
         while idx < total && !content.is_char_boundary(idx) {
             idx += 1;
         }
@@ -620,6 +620,14 @@ let allData = {{}};
 let selectedKey = null;
 let logIndex = 0;
 
+function esc(str) {{
+  return String(str ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}}
+
 function initDates() {{
   const now = new Date();
   const start = new Date(now.getTime() - DAYS_AGO * 86400000);
@@ -683,7 +691,7 @@ function renderCurrent() {{
   const delta = first && last ? last.y - first.y : 0;
 
   let html = `<div class="stats">
-    <h2 style="margin:0">${{selectedKey}}</h2>
+    <h2 style="margin:0">${{esc(selectedKey)}}</h2>
     <div class="points">${{last ? last.y.toLocaleString() : '—'}} pts
       <span style="font-size:1rem;color:${{delta >= 0 ? 'var(--accent2)' : '#ff5555'}}">(${{delta >= 0 ? '+' : ''}}${{delta.toLocaleString()}})</span>
     </div>
@@ -694,7 +702,7 @@ function renderCurrent() {{
   <table><tr><th>Time</th><th>Balance</th><th>Reason</th></tr>`;
 
   for (const ev of series.slice(-20).reverse()) {{
-    html += `<tr><td>${{new Date(ev.x).toLocaleString()}}</td><td>${{ev.y.toLocaleString()}}</td><td><span class="tag">${{ev.z}}</span></td></tr>`;
+    html += `<tr><td>${{new Date(ev.x).toLocaleString()}}</td><td>${{ev.y.toLocaleString()}}</td><td><span class="tag">${{esc(ev.z)}}</span></td></tr>`;
   }}
   html += '</table>';
   box.innerHTML = html;
@@ -732,9 +740,9 @@ function drawChart(series, annotations) {{
     if (a.x < minX || a.x > maxX) continue;
     const ax = sx(a.x).toFixed(1);
     const col = a.borderColor || '#ffe045';
-    const txt = (a.label && a.label.text) ? a.label.text.slice(0, 28) : '';
-    annSvg += `<line x1="${{ax}}" y1="${{pad.t}}" x2="${{ax}}" y2="${{H - pad.b}}" stroke="${{col}}" stroke-dasharray="4,3" stroke-width="1.5"/>`;
-    if (txt) annSvg += `<text x="${{ax}}" y="${{pad.t - 5}}" fill="${{col}}" font-size="10" text-anchor="middle">${{txt}}</text>`;
+    const txt = (a.label && a.label.text) ? esc(a.label.text.slice(0, 28)) : '';
+    annSvg += `<line x1="${{ax}}" y1="${{pad.t}}" x2="${{ax}}" y2="${{H - pad.b}}" stroke="${{esc(col)}}" stroke-dasharray="4,3" stroke-width="1.5"/>`;
+    if (txt) annSvg += `<text x="${{ax}}" y="${{pad.t - 5}}" fill="${{esc(col)}}" font-size="10" text-anchor="middle">${{txt}}</text>`;
   }}
 
   let circles = '';
@@ -763,7 +771,7 @@ function drawChart(series, annotations) {{
       tip.style.display = 'block';
       tip.style.left = Math.min(W - 190, Math.max(8, sx(best.x) + 10)) + 'px';
       tip.style.top = Math.max(8, sy(best.y) - 36) + 'px';
-      tip.innerHTML = `<b>${{best.y.toLocaleString()}} pts</b><br/>${{best.z}}<br/><span style="color:var(--muted)">${{new Date(best.x).toLocaleString()}}</span>`;
+      tip.innerHTML = `<b>${{best.y.toLocaleString()}} pts</b><br/>${{esc(best.z)}}<br/><span style="color:var(--muted)">${{new Date(best.x).toLocaleString()}}</span>`;
     }} else {{
       tip.style.display = 'none';
     }}
@@ -775,13 +783,18 @@ async function pollLogs() {{
   try {{
     const res = await fetch(`/log?json=1&lastIndex=${{logIndex}}`);
     const payload = await res.json();
+    const box = document.getElementById('logbox');
+    if (typeof payload.nextIndex === 'number' && payload.nextIndex < logIndex) {{
+      box.textContent = '';
+    }}
     if (payload.text) {{
-      const box = document.getElementById('logbox');
       if (logIndex === 0) box.textContent = '';
       box.textContent += payload.text;
       box.scrollTop = box.scrollHeight;
     }}
-    logIndex = payload.nextIndex || logIndex;
+    if (typeof payload.nextIndex === 'number') {{
+      logIndex = payload.nextIndex;
+    }}
   }} catch (_) {{}}
 }}
 

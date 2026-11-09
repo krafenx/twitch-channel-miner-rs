@@ -88,7 +88,7 @@ impl StreamInfo {
     pub fn record_minute_watched(&mut self) {
         let now = Utc::now();
         if let Some(prev) = self.last_minute_watched_ts {
-            let delta_mins = (now - prev).num_milliseconds().max(0) as f64 / 60_000.0;
+            let delta_mins = ((now - prev).num_milliseconds().max(0) as f64 / 60_000.0).min(1.5);
             self.minute_watched += delta_mins;
         } else {
             self.minute_watched += 0.35;
@@ -141,13 +141,18 @@ pub struct Streamer {
     pub online_since: Mutex<Option<std::time::Instant>>,
     pub online_at: Mutex<Option<DateTime<Utc>>>,
     pub offline_at: Mutex<Option<DateTime<Utc>>>,
+    pub last_offline_check_at: Mutex<Option<DateTime<Utc>>>,
     pub stream_up_at: Mutex<Option<DateTime<Utc>>>,
 }
 
 impl Streamer {
     pub fn new(username: impl Into<String>) -> Self {
         Self {
-            username: username.into().trim().to_lowercase(),
+            username: username
+                .into()
+                .trim()
+                .trim_start_matches('@')
+                .to_lowercase(),
             channel_id: None,
             channel_points: AtomicU64::new(0),
             initial_points: AtomicU64::new(0),
@@ -165,6 +170,7 @@ impl Streamer {
             online_since: Mutex::new(None),
             online_at: Mutex::new(None),
             offline_at: Mutex::new(None),
+            last_offline_check_at: Mutex::new(None),
             stream_up_at: Mutex::new(None),
         }
     }
@@ -213,9 +219,12 @@ impl Streamer {
             st.last_minute_watched_ts = None;
             true
         } else if !online && was {
+            let now = Utc::now();
             *self.online_since.lock().unwrap() = None;
-            *self.offline_at.lock().unwrap() = Some(Utc::now());
+            *self.offline_at.lock().unwrap() = Some(now);
+            *self.last_offline_check_at.lock().unwrap() = Some(now);
             self.has_watch_streak.store(false, Ordering::Relaxed);
+            self.stream.lock().unwrap().campaigns.clear();
             true
         } else {
             false
@@ -226,12 +235,23 @@ impl Streamer {
         let _ = self.set_online_with_transition(online, false);
     }
 
+    pub fn mark_offline_checked(&self) {
+        *self.last_offline_check_at.lock().unwrap() = Some(Utc::now());
+    }
+
     pub fn is_in_offline_cooldown(&self) -> bool {
+        let now = Utc::now();
         if let Some(off) = *self.offline_at.lock().unwrap() {
-            (Utc::now() - off) < Duration::seconds(60)
-        } else {
-            false
+            if (now - off) < Duration::seconds(60) {
+                return true;
+            }
         }
+        if let Some(chk) = *self.last_offline_check_at.lock().unwrap() {
+            if (now - chk) < Duration::seconds(60) {
+                return true;
+            }
+        }
+        false
     }
 
     pub fn ready_for_minute_watched(&self) -> bool {
@@ -280,13 +300,13 @@ impl Streamer {
     }
 
     /// Upstream `Streamer.drops_condition()`:
-    /// Streamer is online, has `claim_drops` enabled, and has active drop campaigns for the stream.
+    /// Streamer is online, has `claim_drops` enabled, and has active unclaimed drop campaigns for the stream.
     pub fn drops_condition(&self) -> bool {
         if !self.settings.claim_drops || !self.is_online() {
             return false;
         }
         let st = self.stream.lock().unwrap();
-        !st.campaigns.is_empty() || !st.campaigns_ids.is_empty()
+        !st.campaigns.is_empty()
     }
 
     pub fn viewer_has_points_multiplier(&self) -> bool {
