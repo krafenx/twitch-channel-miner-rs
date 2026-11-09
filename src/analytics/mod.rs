@@ -8,9 +8,10 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnalyticsEvent {
@@ -61,6 +62,7 @@ pub struct Analytics {
     refresh_minutes: u64,
     days_ago: u64,
     data: Arc<Mutex<HashMap<String, StreamerSeries>>>,
+    file_mtimes: Mutex<HashMap<PathBuf, SystemTime>>,
 }
 
 impl Analytics {
@@ -72,22 +74,39 @@ impl Analytics {
         let base_dir = base_dir.as_ref().to_path_buf();
         let path = base_dir.join("analytics");
         let _ = fs::create_dir_all(&path);
-        let mut data = HashMap::new();
-        load_series_dir(&path, None, &mut data);
-        if let Ok(entries) = fs::read_dir(&path) {
-            for entry in entries.flatten() {
-                if entry.path().is_dir() {
-                    let folder_account = entry.file_name().to_string_lossy().to_string();
-                    load_series_dir(&entry.path(), Some(&folder_account), &mut data);
-                }
-            }
-        }
-        Self {
+        let s = Self {
             base_dir,
             path,
             refresh_minutes: refresh_minutes.max(1),
             days_ago: days_ago.max(1),
-            data: Arc::new(Mutex::new(data)),
+            data: Arc::new(Mutex::new(HashMap::new())),
+            file_mtimes: Mutex::new(HashMap::new()),
+        };
+        s.refresh_from_disk();
+        s
+    }
+
+    /// Incrementally reloads any `.json` series files modified on disk (e.g. by other per-account miner processes).
+    pub fn refresh_from_disk(&self) {
+        let mut mtimes = self.file_mtimes.lock().unwrap();
+        let mut updates: Vec<(String, StreamerSeries)> = Vec::new();
+        scan_series_dir(&self.path, None, &mut mtimes, &mut updates);
+        if let Ok(entries) = fs::read_dir(&self.path) {
+            for entry in entries.flatten() {
+                let sub = entry.path();
+                if sub.is_dir() {
+                    let folder_account = entry.file_name().to_string_lossy().to_string();
+                    scan_series_dir(&sub, Some(&folder_account), &mut mtimes, &mut updates);
+                }
+            }
+        }
+        drop(mtimes);
+
+        if !updates.is_empty() {
+            let mut map = self.data.lock().unwrap();
+            for (k, series) in updates {
+                map.insert(k, series);
+            }
         }
     }
 
@@ -161,12 +180,17 @@ impl Analytics {
         let temp_file = account_dir.join(format!("{}.json.temp", safe_file_part(streamer)));
         if let Ok(json) = serde_json::to_string_pretty(entry) {
             if fs::write(&temp_file, json).is_ok() {
-                let _ = fs::rename(&temp_file, &file);
+                if fs::rename(&temp_file, &file).is_ok() {
+                    if let Ok(mtime) = fs::metadata(&file).and_then(|m| m.modified()) {
+                        self.file_mtimes.lock().unwrap().insert(file, mtime);
+                    }
+                }
             }
         }
     }
 
     pub fn snapshot(&self) -> HashMap<String, StreamerSeries> {
+        self.refresh_from_disk();
         self.data.lock().unwrap().clone()
     }
 
@@ -259,7 +283,12 @@ impl Analytics {
                 entries
                     .flatten()
                     .map(|e| e.path())
-                    .find(|p| p.extension().and_then(|s| s.to_str()) == Some("log"))
+                    .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("log"))
+                    .max_by_key(|p| {
+                        fs::metadata(p)
+                            .and_then(|m| m.modified())
+                            .unwrap_or(SystemTime::UNIX_EPOCH)
+                    })
             })
         };
 
@@ -282,13 +311,27 @@ impl Analytics {
     }
 
     pub async fn serve(self: Arc<Self>, bind: &str) {
-        let listener = match TcpListener::bind(bind).await {
-            Ok(l) => l,
-            Err(e) => {
-                warn!("Analytics server bind failed on {}: {}", bind, e);
-                return;
+        let mut logged_standby = false;
+        let listener = loop {
+            match TcpListener::bind(bind).await {
+                Ok(l) => break l,
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                    if !logged_standby {
+                        debug!(
+                            "Analytics port {} is already served by another running miner; standing by",
+                            bind
+                        );
+                        logged_standby = true;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                }
+                Err(e) => {
+                    warn!("Analytics server bind failed on {}: {}", bind, e);
+                    return;
+                }
             }
         };
+        self.refresh_from_disk();
         info!("📊 Analytics running on http://{}/", bind);
 
         loop {
@@ -442,10 +485,11 @@ impl Analytics {
     }
 }
 
-fn load_series_dir(
+fn scan_series_dir(
     dir: &Path,
     fallback_account: Option<&str>,
-    data: &mut HashMap<String, StreamerSeries>,
+    mtimes: &mut HashMap<PathBuf, SystemTime>,
+    updates: &mut Vec<(String, StreamerSeries)>,
 ) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
@@ -453,6 +497,12 @@ fn load_series_dir(
     for e in entries.flatten() {
         let p = e.path();
         if p.is_file() && p.extension().and_then(|s| s.to_str()) == Some("json") {
+            let Ok(mtime) = fs::metadata(&p).and_then(|m| m.modified()) else {
+                continue;
+            };
+            if mtimes.get(&p) == Some(&mtime) {
+                continue;
+            }
             if let Ok(text) = fs::read_to_string(&p) {
                 if let Ok(mut series) = serde_json::from_str::<StreamerSeries>(&text) {
                     if series.streamer.is_empty() {
@@ -466,7 +516,8 @@ fn load_series_dir(
                         }
                     }
                     let key = analytics_key(&series.account, &series.streamer);
-                    data.insert(key, series);
+                    mtimes.insert(p, mtime);
+                    updates.push((key, series));
                 }
             }
         }

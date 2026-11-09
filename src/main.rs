@@ -30,6 +30,14 @@ struct Args {
     #[arg(long)]
     config: Option<PathBuf>,
 
+    /// Run only specific account(s) from --config (comma separated); omit to run all accounts
+    #[arg(short, long = "account", value_delimiter = ',')]
+    accounts: Vec<String>,
+
+    /// List configured accounts from --config and exit
+    #[arg(long, default_value_t = false)]
+    list_accounts: bool,
+
     /// Twitch username
     #[arg(short, long)]
     username: Option<String>,
@@ -97,6 +105,10 @@ struct Args {
     /// Disable saving logs to disk
     #[arg(long, default_value_t = false)]
     no_save_logs: bool,
+
+    /// Always prefix console output and notifications with [username]
+    #[arg(long, default_value_t = false)]
+    console_username: bool,
 
     /// Timezone for log timestamps (e.g. "+03:00" or "Europe/Moscow")
     #[arg(long, default_value = "")]
@@ -189,12 +201,47 @@ async fn main() -> Result<()> {
     let force_no_emoji = args.no_emoji;
     let force_less = args.less;
     let force_no_save = args.no_save_logs;
+    let force_console_username = args.console_username;
+    let list_accounts = args.list_accounts;
+
+    let mut selected_accounts: Vec<String> = args
+        .accounts
+        .iter()
+        .map(|s| normalize_channel_name(s))
+        .filter(|s| !s.is_empty())
+        .collect();
+    if selected_accounts.is_empty() && args.config.is_some() {
+        if let Some(u) = args.username.as_deref() {
+            let clean = normalize_channel_name(u);
+            if !clean.is_empty() {
+                selected_accounts.push(clean);
+            }
+        }
+    }
 
     let mut app_config = match args.config.clone() {
         Some(path) => AppConfig::load(&path)
             .map_err(|e| MinerError::Auth(format!("Could not load config: {e}")))?,
         None => build_cli_config(args),
     };
+
+    if list_accounts {
+        let configured = app_config.effective_accounts();
+        if configured.is_empty() {
+            println!("No accounts configured.");
+        } else {
+            for (idx, acc) in configured.iter().enumerate() {
+                println!(
+                    "{}. {} (channels: {}, followers: {})",
+                    idx + 1,
+                    acc.username,
+                    acc.streamers.len(),
+                    acc.followers
+                );
+            }
+        }
+        return Ok(());
+    }
 
     if force_no_color {
         app_config.logger.colored = false;
@@ -220,8 +267,14 @@ async fn main() -> Result<()> {
             acc.logger.save = false;
         }
     }
+    if force_console_username {
+        app_config.logger.console_username = true;
+        for acc in &mut app_config.accounts {
+            acc.logger.console_username = true;
+        }
+    }
 
-    run_miner_app(app_config).await
+    run_miner_app(app_config, &selected_accounts).await
 }
 
 fn build_cli_config(args: Args) -> AppConfig {
@@ -322,13 +375,39 @@ fn build_cli_config(args: Args) -> AppConfig {
     cfg
 }
 
-async fn run_miner_app(app_config: AppConfig) -> Result<()> {
-    let mut accounts = app_config.effective_accounts();
-    if accounts.is_empty() {
+async fn run_miner_app(app_config: AppConfig, selected_accounts: &[String]) -> Result<()> {
+    let all_accounts = app_config.effective_accounts();
+    if all_accounts.is_empty() {
         return Err(MinerError::Auth(
             "Set --username or configure at least one Twitch username in the app config".into(),
         ));
     }
+
+    let mut accounts: Vec<AccountConfig> = if selected_accounts.is_empty() {
+        all_accounts.clone()
+    } else {
+        for req in selected_accounts {
+            if !all_accounts
+                .iter()
+                .any(|a| normalize_channel_name(&a.username) == *req)
+            {
+                let available: Vec<&str> =
+                    all_accounts.iter().map(|a| a.username.as_str()).collect();
+                return Err(MinerError::Auth(format!(
+                    "Account '{}' not found in config (available: {})",
+                    req,
+                    available.join(", ")
+                )));
+            }
+        }
+        all_accounts
+            .into_iter()
+            .filter(|a| {
+                let norm = normalize_channel_name(&a.username);
+                selected_accounts.iter().any(|req| req == &norm)
+            })
+            .collect()
+    };
 
     // If multiple accounts are running simultaneously, automatically enable `[username]` prefix
     if accounts.len() > 1 {
