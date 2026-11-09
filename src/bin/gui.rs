@@ -1,8 +1,9 @@
 use eframe::egui;
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, Sender};
 use twitch_points_miner::bet::{Comparison, DelayMode, FilterCondition, FilterMetric, Strategy};
 use twitch_points_miner::chat::ChatPresence;
 use twitch_points_miner::config::{AccountConfig, AppConfig, FollowersOrder};
@@ -14,16 +15,27 @@ use twitch_points_miner::notify::{
 };
 use twitch_points_miner::settings::{MinerEvent, Priority};
 
+struct LogEntry {
+    account: String,
+    line: String,
+}
+
 struct MinerApp {
     config: AppConfig,
     config_path: PathBuf,
     selected_account: usize,
     streamer_input: String,
     blacklist_input: String,
-    child: Option<Child>,
-    log_rx: Receiver<String>,
-    log_lines: Vec<String>,
+    children: BTreeMap<String, Child>,
+    log_tx: Sender<LogEntry>,
+    log_rx: Receiver<LogEntry>,
+    log_lines: Vec<LogEntry>,
+    log_filter_account: Option<String>,
     status: String,
+}
+
+fn normalize_account_key(raw: &str) -> String {
+    raw.trim().trim_start_matches('@').to_lowercase()
 }
 
 impl MinerApp {
@@ -38,18 +50,37 @@ impl MinerApp {
         config.promote_legacy_account();
         config.load_legacy_fields(0);
         let blacklist_input = config.blacklist.join(", ");
-        let (_log_tx, log_rx) = mpsc::channel();
+        let (log_tx, log_rx) = mpsc::channel();
         Self {
             config,
             config_path: path,
             selected_account: 0,
             streamer_input: String::new(),
             blacklist_input,
-            child: None,
+            children: BTreeMap::new(),
+            log_tx,
             log_rx,
             log_lines: Vec::new(),
+            log_filter_account: None,
             status,
         }
+    }
+
+    fn is_account_running(&self, username: &str) -> bool {
+        let key = normalize_account_key(username);
+        !key.is_empty() && self.children.contains_key(&key)
+    }
+
+    fn cli_executable() -> Result<PathBuf, String> {
+        std::env::current_exe()
+            .map(|path| {
+                path.with_file_name(if cfg!(windows) {
+                    "twitch-points-miner.exe"
+                } else {
+                    "twitch-points-miner"
+                })
+            })
+            .map_err(|error| format!("Не удалось определить путь к CLI: {error}"))
     }
 
     fn save(&mut self) {
@@ -60,68 +91,191 @@ impl MinerApp {
         }
     }
 
-    fn start(&mut self) {
-        self.commit_active_account();
-        if self.child.is_some() {
-            return;
+    fn spawn_account_process(
+        &mut self,
+        executable: &PathBuf,
+        account: &AccountConfig,
+    ) -> Result<bool, String> {
+        let key = normalize_account_key(&account.username);
+        if key.is_empty() {
+            return Err("Укажите логин Twitch-аккаунта".into());
         }
-        let accounts = self.config.effective_accounts();
-        if accounts.is_empty() {
-            self.status = "Добавьте хотя бы один Twitch-аккаунт".into();
-            return;
+        if self.children.contains_key(&key) {
+            return Ok(false);
         }
-        if accounts
-            .iter()
-            .any(|account| account.streamers.is_empty() && !account.followers)
-        {
-            self.status =
-                "Для каждого аккаунта добавьте каналы или включите загрузку подписок".into();
-            return;
+        if account.streamers.is_empty() && !account.followers {
+            return Err(format!(
+                "Для аккаунта '{}' добавьте каналы или включите загрузку подписок",
+                account.username
+            ));
         }
-        if let Err(error) = self.config.save(&self.config_path) {
-            self.status = format!("Не удалось сохранить настройки: {error}");
-            return;
-        }
-        let executable = match std::env::current_exe() {
-            Ok(path) => path.with_file_name(if cfg!(windows) {
-                "twitch-points-miner.exe"
-            } else {
-                "twitch-points-miner"
-            }),
-            Err(error) => {
-                self.status = format!("Не удалось определить путь к CLI: {error}");
-                return;
-            }
-        };
-        let (log_tx, log_rx) = mpsc::channel();
+
         match Command::new(executable)
             .arg("--config")
             .arg(&self.config_path)
+            .arg("--account")
+            .arg(&key)
             .arg("--no-color")
+            .arg("--console-username")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
         {
             Ok(mut child) => {
-                forward_output(child.stdout.take(), log_tx.clone());
-                forward_output(child.stderr.take(), log_tx);
-                self.log_rx = log_rx;
-                self.log_lines.clear();
-                self.child = Some(child);
-                self.status = "Майнер запущен. Для первого входа подтвердите код в Twitch.".into();
+                forward_output(key.clone(), child.stdout.take(), self.log_tx.clone());
+                forward_output(key.clone(), child.stderr.take(), self.log_tx.clone());
+                self.children.insert(key, child);
+                Ok(true)
             }
-            Err(error) => self.status = format!("Не удалось запустить CLI: {error}"),
+            Err(error) => Err(format!(
+                "Не удалось запустить CLI для '{}': {error}",
+                account.username
+            )),
         }
     }
 
-    fn stop(&mut self) {
-        if let Some(mut child) = self.child.take() {
+    fn start_account(&mut self, index: usize) {
+        self.commit_active_account();
+        let Some(account) = self.config.accounts.get(index).cloned() else {
+            return;
+        };
+        if normalize_account_key(&account.username).is_empty() {
+            self.status = "Укажите логин Twitch-аккаунта перед запуском".into();
+            return;
+        }
+        if account.streamers.is_empty() && !account.followers {
+            self.status = format!(
+                "Для аккаунта '{}' добавьте каналы или включите загрузку подписок",
+                account.username
+            );
+            return;
+        }
+        if let Err(error) = self.config.save(&self.config_path) {
+            self.status = format!("Не удалось сохранить настройки: {error}");
+            return;
+        }
+        let executable = match Self::cli_executable() {
+            Ok(p) => p,
+            Err(msg) => {
+                self.status = msg;
+                return;
+            }
+        };
+        match self.spawn_account_process(&executable, &account) {
+            Ok(true) => {
+                self.status = format!(
+                    "Майнер запущен для аккаунта '{}' (активных: {}).",
+                    account.username.trim(),
+                    self.children.len()
+                );
+            }
+            Ok(false) => {
+                self.status = format!("Аккаунт '{}' уже запущен", account.username.trim());
+            }
+            Err(msg) => {
+                self.status = msg;
+            }
+        }
+    }
+
+    fn start_all(&mut self) {
+        self.commit_active_account();
+        let accounts = self.config.effective_accounts();
+        if accounts.is_empty() {
+            self.status = "Добавьте хотя бы один Twitch-аккаунт".into();
+            return;
+        }
+        let mut seen = std::collections::HashSet::new();
+        for account in &accounts {
+            let key = normalize_account_key(&account.username);
+            if !seen.insert(key) {
+                self.status = format!(
+                    "Аккаунт '{}' указан несколько раз — удалите дубликат",
+                    account.username
+                );
+                return;
+            }
+            if account.streamers.is_empty() && !account.followers {
+                self.status = format!(
+                    "Для аккаунта '{}' добавьте каналы или включите загрузку подписок",
+                    account.username
+                );
+                return;
+            }
+        }
+        if let Err(error) = self.config.save(&self.config_path) {
+            self.status = format!("Не удалось сохранить настройки: {error}");
+            return;
+        }
+        let executable = match Self::cli_executable() {
+            Ok(p) => p,
+            Err(msg) => {
+                self.status = msg;
+                return;
+            }
+        };
+
+        let mut started_now = 0usize;
+        for account in &accounts {
+            match self.spawn_account_process(&executable, account) {
+                Ok(true) => started_now += 1,
+                Ok(false) => {}
+                Err(msg) => {
+                    self.status = msg;
+                    return;
+                }
+            }
+        }
+
+        if started_now == 0 {
+            self.status = format!(
+                "Все настроенные аккаунты уже запущены ({})",
+                self.children.len()
+            );
+        } else {
+            self.status = format!(
+                "Майнер запущен на всех аккаунтах (новых: {started_now}, всего активных: {}).",
+                self.children.len()
+            );
+        }
+    }
+
+    fn stop_account(&mut self, username: &str) {
+        let key = normalize_account_key(username);
+        if let Some(mut child) = self.children.remove(&key) {
             match child.kill() {
-                Ok(()) => self.status = "Майнер остановлен".into(),
-                Err(error) => self.status = format!("Не удалось остановить майнер: {error}"),
+                Ok(()) => {
+                    self.status = format!(
+                        "Аккаунт '{}' остановлен (активных: {})",
+                        username.trim(),
+                        self.children.len()
+                    );
+                }
+                Err(error) => {
+                    self.status =
+                        format!("Не удалось остановить аккаунт '{}': {error}", username.trim());
+                }
             }
             let _ = child.wait();
+        }
+    }
+
+    fn stop_all(&mut self) {
+        let keys: Vec<String> = self.children.keys().cloned().collect();
+        let mut last_err = None;
+        for key in keys {
+            if let Some(mut child) = self.children.remove(&key) {
+                if let Err(error) = child.kill() {
+                    last_err = Some(format!("{key}: {error}"));
+                }
+                let _ = child.wait();
+            }
+        }
+        if let Some(err) = last_err {
+            self.status = format!("Ошибка при остановке: {err}");
+        } else {
+            self.status = "Все аккаунты остановлены".into();
         }
     }
 
@@ -181,6 +335,16 @@ impl MinerApp {
     }
 
     fn remove_account(&mut self) {
+        if let Some(acc) = self.config.accounts.get(self.selected_account) {
+            let uname = acc.username.clone();
+            if self.is_account_running(&uname) {
+                self.stop_account(&uname);
+            }
+            let key = normalize_account_key(&uname);
+            if self.log_filter_account.as_deref() == Some(key.as_str()) {
+                self.log_filter_account = None;
+            }
+        }
         if self.config.accounts.len() <= 1 {
             self.config.accounts[0] = AccountConfig::default();
             self.selected_account = 0;
@@ -195,30 +359,36 @@ impl MinerApp {
 
 impl Drop for MinerApp {
     fn drop(&mut self) {
-        self.stop();
+        self.stop_all();
     }
 }
 
 impl eframe::App for MinerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        while let Ok(line) = self.log_rx.try_recv() {
-            self.log_lines.push(line);
-            if self.log_lines.len() > 800 {
+        while let Ok(entry) = self.log_rx.try_recv() {
+            self.log_lines.push(entry);
+            if self.log_lines.len() > 1200 {
                 self.log_lines.remove(0);
             }
         }
-        if let Some(child) = self.child.as_mut() {
+        let mut finished = Vec::new();
+        for (key, child) in &mut self.children {
             match child.try_wait() {
                 Ok(Some(exit)) => {
-                    self.child = None;
-                    self.status = format!("Майнер завершился ({exit})");
+                    finished.push((key.clone(), format!("Аккаунт '{key}' завершился ({exit})")));
                 }
                 Err(error) => {
-                    self.child = None;
-                    self.status = format!("Не удалось проверить процесс: {error}");
+                    finished.push((
+                        key.clone(),
+                        format!("Не удалось проверить процесс '{key}': {error}"),
+                    ));
                 }
                 _ => {}
             }
+        }
+        for (key, msg) in finished {
+            self.children.remove(&key);
+            self.status = msg;
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -229,6 +399,9 @@ impl eframe::App for MinerApp {
                     ui.label("Полный порт Twitch-Channel-Points-Miner-v2: профили, автоставки, Drops, приоритеты, аналитика и уведомления.");
                     ui.add_space(10.0);
 
+                    // Ensure active edits are reflected in account summaries
+                    self.commit_active_account();
+
                     let account_labels: Vec<String> = self
                         .config
                         .accounts
@@ -238,15 +411,27 @@ impl eframe::App for MinerApp {
                             let name = if account.username.trim().is_empty() {
                                 "Новый аккаунт"
                             } else {
-                                &account.username
+                                account.username.trim()
                             };
-                            format!("{}. {}", index + 1, name)
+                            let marker = if self.is_account_running(&account.username) {
+                                "🟢"
+                            } else {
+                                "⚪"
+                            };
+                            format!("{marker} {}. {name}", index + 1)
                         })
                         .collect();
+
+                    let current_username = self.config.username.trim().to_string();
+                    let selected_running = self.is_account_running(&current_username);
+
                     let mut switch_to = None;
                     let mut add_account = false;
                     let mut remove_account = false;
-                    ui.horizontal(|ui| {
+                    let mut start_single_idx: Option<usize> = None;
+                    let mut stop_single_name: Option<String> = None;
+
+                    ui.horizontal_wrapped(|ui| {
                         ui.label("Профиль аккаунта");
                         egui::ComboBox::from_id_salt("accounts")
                             .selected_text(
@@ -271,7 +456,92 @@ impl eframe::App for MinerApp {
                         if ui.button("Удалить").clicked() {
                             remove_account = true;
                         }
+                        if selected_running {
+                            if ui
+                                .button(format!("⏹ Остановить ({current_username})"))
+                                .clicked()
+                            {
+                                stop_single_name = Some(current_username.clone());
+                            }
+                        } else if ui
+                            .add_enabled(
+                                !current_username.is_empty(),
+                                egui::Button::new(if current_username.is_empty() {
+                                    "▶ Запустить этот аккаунт".to_string()
+                                } else {
+                                    format!("▶ Запустить ({current_username})")
+                                }),
+                            )
+                            .clicked()
+                        {
+                            start_single_idx = Some(self.selected_account);
+                        }
                     });
+
+                    // Per-account launch / stop panel when one or more accounts exist
+                    egui::CollapsingHeader::new(format!(
+                        "Запуск по аккаунтам (активно: {} / {})",
+                        self.children.len(),
+                        self.config.effective_accounts().len()
+                    ))
+                    .id_salt("per_account_runner")
+                    .default_open(self.config.accounts.len() > 1 || !self.children.is_empty())
+                    .show(ui, |ui| {
+                        let snapshot_accounts = self.config.accounts.clone();
+                        for (idx, acc) in snapshot_accounts.iter().enumerate() {
+                            let uname = acc.username.trim();
+                            let display_name = if uname.is_empty() {
+                                format!("Профиль #{} (не задан логин)", idx + 1)
+                            } else {
+                                uname.to_string()
+                            };
+                            let running = self.is_account_running(uname);
+                            ui.horizontal(|ui| {
+                                let badge_color = if running {
+                                    egui::Color32::from_rgb(54, 181, 53)
+                                } else {
+                                    egui::Color32::from_rgb(150, 150, 160)
+                                };
+                                ui.label(
+                                    egui::RichText::new(if running {
+                                        "● Работает"
+                                    } else {
+                                        "○ Остановлен"
+                                    })
+                                    .color(badge_color),
+                                );
+                                ui.label(format!(
+                                    "{}. {} (каналов: {}{})",
+                                    idx + 1,
+                                    display_name,
+                                    acc.streamers.len(),
+                                    if acc.followers { " + подписки" } else { "" }
+                                ));
+                                if running {
+                                    if ui.small_button("⏹ Остановить").clicked() {
+                                        stop_single_name = Some(uname.to_string());
+                                    }
+                                } else if ui
+                                    .add_enabled(!uname.is_empty(), egui::Button::new("▶ Запустить").small())
+                                    .clicked()
+                                {
+                                    start_single_idx = Some(idx);
+                                }
+                                if idx != self.selected_account
+                                    && ui.small_button("Настроить").clicked()
+                                {
+                                    switch_to = Some(idx);
+                                }
+                                if !uname.is_empty() {
+                                    let key = normalize_account_key(uname);
+                                    if ui.small_button("Журнал").clicked() {
+                                        self.log_filter_account = Some(key);
+                                    }
+                                }
+                            });
+                        }
+                    });
+
                     if let Some(index) = switch_to {
                         self.switch_account(index);
                     }
@@ -281,13 +551,27 @@ impl eframe::App for MinerApp {
                     if remove_account {
                         self.remove_account();
                     }
+                    if let Some(idx) = start_single_idx {
+                        self.start_account(idx);
+                    }
+                    if let Some(uname) = stop_single_name {
+                        self.stop_account(&uname);
+                    }
+
+                    let current_selected_running = self.is_account_running(&self.config.username);
 
                     egui::Grid::new("account_settings")
                         .num_columns(2)
                         .spacing([12.0, 8.0])
                         .show(ui, |ui| {
                             ui.label("Twitch-аккаунт");
-                            ui.text_edit_singleline(&mut self.config.username);
+                            ui.add_enabled(
+                                !current_selected_running,
+                                egui::TextEdit::singleline(&mut self.config.username),
+                            )
+                            .on_disabled_hover_text(
+                                "Остановите этот аккаунт перед изменением логина",
+                            );
                             ui.end_row();
 
                             ui.label("Присутствие в чате");
@@ -804,29 +1088,87 @@ impl eframe::App for MinerApp {
                         });
 
                     ui.add_space(14.0);
-                    ui.horizontal(|ui| {
+                    let effective_count = self.config.effective_accounts().len();
+                    let running_count = self.children.len();
+                    let active_uname = self.config.username.trim().to_string();
+                    let active_is_running = self.is_account_running(&active_uname);
+
+                    ui.horizontal_wrapped(|ui| {
                         if ui.button("Сохранить").clicked() {
                             self.save();
                         }
-                        if self.child.is_some() {
-                            if ui.button("Остановить").clicked() {
-                                self.stop();
+                        if ui
+                            .add_enabled(
+                                effective_count > 0 && running_count < effective_count,
+                                egui::Button::new("▶ Запустить на всех аккаунтах"),
+                            )
+                            .clicked()
+                        {
+                            self.start_all();
+                        }
+                        if running_count > 0 && ui.button("⏹ Остановить все аккаунты").clicked() {
+                            self.stop_all();
+                        }
+                        if active_is_running {
+                            if ui
+                                .button(format!("⏹ Остановить '{active_uname}'"))
+                                .clicked()
+                            {
+                                self.stop_account(&active_uname);
                             }
-                        } else if ui.button("Запустить майнер").clicked() {
-                            self.start();
+                        } else if !active_uname.is_empty()
+                            && ui
+                                .button(format!("▶ Запустить '{active_uname}'"))
+                                .clicked()
+                        {
+                            self.start_account(self.selected_account);
                         }
                     });
                     ui.label(&self.status);
                     egui::CollapsingHeader::new("Журнал майнера")
                         .default_open(true)
                         .show(ui, |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label("Фильтр:");
+                                if ui
+                                    .selectable_label(self.log_filter_account.is_none(), "Все аккаунты")
+                                    .clicked()
+                                {
+                                    self.log_filter_account = None;
+                                }
+                                for acc in &self.config.accounts {
+                                    let uname = acc.username.trim();
+                                    if uname.is_empty() {
+                                        continue;
+                                    }
+                                    let key = normalize_account_key(uname);
+                                    let selected =
+                                        self.log_filter_account.as_deref() == Some(key.as_str());
+                                    if ui.selectable_label(selected, uname).clicked() {
+                                        self.log_filter_account = Some(key);
+                                    }
+                                }
+                                if !self.log_lines.is_empty() && ui.small_button("Очистить").clicked()
+                                {
+                                    self.log_lines.clear();
+                                }
+                            });
                             egui::ScrollArea::vertical()
                                 .id_salt("logs_scroll")
-                                .max_height(160.0)
+                                .max_height(180.0)
                                 .stick_to_bottom(true)
                                 .show(ui, |ui| {
-                                    for line in &self.log_lines {
-                                        ui.label(egui::RichText::new(line).monospace().size(11.0));
+                                    for entry in &self.log_lines {
+                                        if let Some(filter) = &self.log_filter_account {
+                                            if &entry.account != filter {
+                                                continue;
+                                            }
+                                        }
+                                        ui.label(
+                                            egui::RichText::new(&entry.line)
+                                                .monospace()
+                                                .size(11.0),
+                                        );
                                     }
                                 });
                         });
@@ -1088,11 +1430,22 @@ fn chat_label(mode: ChatPresence) -> &'static str {
     }
 }
 
-fn forward_output<R: Read + Send + 'static>(output: Option<R>, tx: mpsc::Sender<String>) {
+fn forward_output<R: Read + Send + 'static>(
+    account: String,
+    output: Option<R>,
+    tx: mpsc::Sender<LogEntry>,
+) {
     if let Some(output) = output {
         std::thread::spawn(move || {
             for line in BufReader::new(output).lines().map_while(Result::ok) {
-                if tx.send(strip_ansi_codes(&line)).is_err() {
+                let cleaned = strip_ansi_codes(&line);
+                if tx
+                    .send(LogEntry {
+                        account: account.clone(),
+                        line: cleaned,
+                    })
+                    .is_err()
+                {
                     break;
                 }
             }
